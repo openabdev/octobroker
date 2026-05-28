@@ -6,7 +6,7 @@ Internal GitHub API proxy with PAT pooling and caching. Open source, designed fo
 
 - **Cloud-native** — runs on any Kubernetes (Amazon EKS, Google Cloud GKE, self-managed k8s) and Amazon ECS. Single static binary, no runtime dependencies.
 - **Built for agents, not humans** — optimized for high-throughput, concurrent API access from multiple coding agents sharing the same repos.
-- **Secrets-first** — credentials are resolved at runtime from AWS Secrets Manager, Kubernetes secrets, or environment variables. No plain text tokens stored at rest or in transit.
+- **Secrets-first** — credentials are resolved at runtime from AWS Secrets Manager, Google Cloud Secret Manager, or Kubernetes secrets. No plain text tokens stored at rest or in transit.
 - **Private network isolation** — designed to run inside your trusted network (on-premises, cloud VPC, or service mesh). No public endpoints, no external dependencies beyond GitHub API.
 
 ## Architecture
