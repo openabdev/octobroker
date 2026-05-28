@@ -67,7 +67,9 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          cd ghp && cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -76,6 +78,7 @@ jobs:
           NAME="ghpool-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir -p dist
           cp target/${{ matrix.target }}/release/ghpool${{ matrix.ext }} dist/
+          cp ghp/target/${{ matrix.target }}/release/ghp${{ matrix.ext }} dist/
           cp config.example.toml dist/
           cd dist
           tar czf ../${NAME}.tar.gz *
