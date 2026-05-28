@@ -9,6 +9,59 @@ Internal GitHub API proxy with PAT pooling and caching. Open source, designed fo
 - **Secrets-first** — credentials are resolved at runtime from AWS Secrets Manager, Kubernetes secrets, or environment variables. No plain text tokens stored at rest or in transit.
 - **Private network isolation** — designed to run inside your trusted network (on-premises, cloud VPC, or service mesh). No public endpoints, no external dependencies beyond GitHub API.
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Private Network / VPC                         │
+│                                                                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                          │
+│  │ Agent A  │  │ Agent B  │  │ gh CLI   │                          │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                          │
+│       │              │              │                                │
+│       └──────────────┼──────────────┘                                │
+│                      │                                               │
+│                      ▼                                               │
+│            ┌───────────────────┐                                     │
+│            │      ghpool       │                                     │
+│            │                   │                                     │
+│            │  ┌─────────────┐  │      ┌──────────────────────┐      │
+│            │  │  PAT Pool   │  │      │  Secrets Manager     │      │
+│            │  │             │◄─┼──────│  (AWS/K8s/Env)       │      │
+│            │  │ chaodu: 4998│  │      └──────────────────────┘      │
+│            │  │ thepagent:  │  │                                     │
+│            │  │         1889│  │                                     │
+│            │  └─────────────┘  │                                     │
+│            │  ┌─────────────┐  │                                     │
+│            │  │    Cache    │  │                                     │
+│            │  │  (in-mem)   │  │                                     │
+│            │  └─────────────┘  │                                     │
+│            └────────┬──────────┘                                     │
+│                     │                                                │
+└─────────────────────┼────────────────────────────────────────────────┘
+                      │
+                      ▼
+            ┌───────────────────┐
+            │  api.github.com   │
+            └───────────────────┘
+
+Request Flow:
+
+  GET /repos/org/repo/pulls
+    → cache HIT? return cached
+    → cache MISS: select PAT with highest remaining budget
+    → forward to GitHub, cache response, update rate limits
+
+  POST /graphql (query)
+    → cache HIT? return cached
+    → cache MISS: select pooled PAT, forward, cache response
+
+  POST /graphql (mutation)
+    → require client Authorization header
+    → passthrough to GitHub (no pooling, no caching)
+    → resolve + log GitHub username from token
+```
+
 ## What it does
 
 - Pools multiple GitHub PATs and routes each read request through the identity with the most remaining rate limit budget
@@ -154,6 +207,38 @@ POST /graphql
 - **Mutations** — client's own `Authorization` header passed through to GitHub (no pooling, no caching)
 
 If a mutation request has no `Authorization` header, ghpool returns `401`.
+
+```
+  ┌────────────────────────────────────────────────────────────────┐
+  │                    POST /graphql                                │
+  │                                                                │
+  │  Parse request body → extract "query" field                    │
+  │                                                                │
+  │  ┌─────────────────────┐       ┌────────────────────────────┐  │
+  │  │ starts with "query" │       │ starts with "mutation"     │  │
+  │  └──────────┬──────────┘       └──────────────┬─────────────┘  │
+  │             │                                  │                │
+  │             ▼                                  ▼                │
+  │  ┌─────────────────────┐       ┌────────────────────────────┐  │
+  │  │ Check cache         │       │ Require client             │  │
+  │  │  HIT → return       │       │ Authorization header       │  │
+  │  │  MISS ↓             │       │  missing → 401             │  │
+  │  └──────────┬──────────┘       └──────────────┬─────────────┘  │
+  │             │                                  │                │
+  │             ▼                                  ▼                │
+  │  ┌─────────────────────┐       ┌────────────────────────────┐  │
+  │  │ Select pooled PAT   │       │ Passthrough client's token │  │
+  │  │ (highest budget)    │       │ (identity preserved)       │  │
+  │  └──────────┬──────────┘       └──────────────┬─────────────┘  │
+  │             │                                  │                │
+  │             ▼                                  ▼                │
+  │  ┌─────────────────────┐       ┌────────────────────────────┐  │
+  │  │ Forward to GitHub   │       │ Forward to GitHub           │  │
+  │  │ Cache response      │       │ No caching                 │  │
+  │  │ Update rate limits  │       │ Log resolved username      │  │
+  │  └─────────────────────┘       └────────────────────────────┘  │
+  └────────────────────────────────────────────────────────────────┘
+```
 
 ### Management
 
