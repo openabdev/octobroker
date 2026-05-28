@@ -1,6 +1,6 @@
 # ghpool
 
-Internal GitHub API proxy with PAT pooling and caching. Open source, designed for enterprise.
+GitHub API proxy that pools PATs for rate limit sharing, caches read responses, and passes through mutations — built for coding agents running in private networks.
 
 ## Design Principles
 
