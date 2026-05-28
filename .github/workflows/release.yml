@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, os: linux, arch: x64, ext: "", archive: tar.gz }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, os: linux, arch: arm64, ext: "", archive: tar.gz }
+          - { target: x86_64-apple-darwin, runner: macos-latest, os: darwin, arch: x64, ext: "", archive: tar.gz }
+          - { target: aarch64-apple-darwin, runner: macos-latest, os: darwin, arch: arm64, ext: "", archive: tar.gz }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          NAME="ghpool-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/ghpool${{ matrix.ext }} dist/
+          cp config.example.toml dist/
+          cd dist
+          tar czf ../${NAME}.tar.gz *
+
+      - name: Create release and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${{ steps.tag.outputs.version }}"
+          NAME="ghpool-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          gh release create "$TAG" --generate-notes --draft 2>/dev/null || true
+          gh release upload "$TAG" "$NAME" --clobber
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghpool-${{ matrix.os }}-${{ matrix.arch }}
+          path: ghpool-*.tar.gz
+          retention-days: 7
