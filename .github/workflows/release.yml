@@ -12,7 +12,27 @@ on:
         type: string
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.tag.outputs.tag }}" --generate-notes --draft
+
   build:
+    needs: create-release
     strategy:
       matrix:
         include:
@@ -60,7 +80,7 @@ jobs:
           cd dist
           tar czf ../${NAME}.tar.gz *
 
-      - name: Create release and upload
+      - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -68,7 +88,6 @@ jobs:
           TAG="${{ steps.tag.outputs.tag }}"
           VERSION="${{ steps.tag.outputs.version }}"
           NAME="ghpool-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
-          gh release create "$TAG" --generate-notes --draft 2>/dev/null || true
           gh release upload "$TAG" "$NAME" --clobber
 
       - name: Upload artifact
