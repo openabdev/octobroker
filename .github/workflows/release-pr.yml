@@ -1,0 +1,57 @@
+name: Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (leave empty to auto-bump minor, or specify e.g. 0.2.0)"
+        required: false
+        type: string
+
+jobs:
+  create-release-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+            IFS='.' read -r major minor patch <<< "$CURRENT"
+            minor=$((minor + 1))
+            patch=0
+            VERSION="${major}.${minor}.${patch}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release version: ${VERSION}"
+
+      - name: Update Cargo.toml version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
+
+      - name: Create release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BRANCH="release/v${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "release: v${VERSION}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "release: v${VERSION}" \
+            --body "Merge this PR to tag \`v${VERSION}\` and trigger the release build." \
+            --base main --head "$BRANCH"
