@@ -36,8 +36,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, os: linux, arch: x64, ext: "", archive: tar.gz }
-          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, os: linux, arch: arm64, ext: "", archive: tar.gz }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest, os: linux, arch: x64, ext: "", archive: tar.gz }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, os: linux, arch: arm64, ext: "", archive: tar.gz }
           - { target: x86_64-apple-darwin, runner: macos-latest, os: darwin, arch: x64, ext: "", archive: tar.gz }
           - { target: aarch64-apple-darwin, runner: macos-latest, os: darwin, arch: arm64, ext: "", archive: tar.gz }
     runs-on: ${{ matrix.runner }}
@@ -61,6 +61,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: Swatinem/rust-cache@v2
         with:
