@@ -6,6 +6,14 @@ fn main() {
     let ghpool_url = env::var("GHPOOL_URL")
         .unwrap_or_else(|_| "http://ghpool.openab.local:8080".to_string());
 
+    // Handle version
+    if args.first().map(|s| s.as_str()) == Some("version") || args.first().map(|s| s.as_str()) == Some("--version") {
+        println!("ghp version {}", env!("CARGO_PKG_VERSION"));
+        let gh = find_real_gh();
+        let _ = Command::new(&gh).arg("--version").status();
+        exit(0);
+    }
+
     // Try to handle as a pooled read via ghpool REST
     if let Some(code) = try_pooled(&args, &ghpool_url) {
         exit(code);
