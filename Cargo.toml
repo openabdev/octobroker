@@ -19,3 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+hyper = "1"

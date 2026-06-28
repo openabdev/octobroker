@@ -28,6 +28,8 @@ fn try_pooled(args: &[String], base: &str) -> Option<i32> {
         "issue" if args.get(1).map(|s| s.as_str()) == Some("view") => try_issue_view(args, base),
         "pr" if args.get(1).map(|s| s.as_str()) == Some("list") => try_pr_list(args, base),
         "pr" if args.get(1).map(|s| s.as_str()) == Some("view") => try_pr_view(args, base),
+        "pr" if args.get(1).map(|s| s.as_str()) == Some("diff") => try_pr_diff(args, base),
+        "pr" if args.get(1).map(|s| s.as_str()) == Some("checks") => try_pr_checks(args, base),
         "run" if args.get(1).map(|s| s.as_str()) == Some("list") => try_run_list(args, base),
         _ => None,
     }
@@ -131,6 +133,48 @@ fn try_pr_view(args: &[String], base: &str) -> Option<i32> {
     Some(0)
 }
 
+// gh pr diff <number> -R owner/repo
+fn try_pr_diff(args: &[String], base: &str) -> Option<i32> {
+    let repo = repo_flag(args)?;
+    let number = args.get(2).and_then(|s| s.parse::<u64>().ok())?;
+
+    let url = format!("{}/raw/repos/{}/pulls/{}", base, repo, number);
+    let client = reqwest::blocking::Client::new();
+    let resp = client.get(&url)
+        .header("Accept", "application/vnd.github.v3.diff")
+        .send().ok()?;
+    if !resp.status().is_success() { return None; }
+    print!("{}", resp.text().ok()?);
+    Some(0)
+}
+
+// gh pr checks <number> -R owner/repo
+fn try_pr_checks(args: &[String], base: &str) -> Option<i32> {
+    let repo = repo_flag(args)?;
+    let number = args.get(2).and_then(|s| s.parse::<u64>().ok())?;
+
+    // Get the PR head SHA
+    let pr_url = format!("{}/repos/{}/pulls/{}", base, repo, number);
+    let pr_body = http_get(&pr_url)?;
+    let pr: serde_json::Value = serde_json::from_str(&pr_body).ok()?;
+    let sha = pr["head"]["sha"].as_str()?;
+
+    // Get check runs for that SHA
+    let url = format!("{}/repos/{}/commits/{}/check-runs", base, repo, sha);
+    let body = http_get(&url)?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let runs = v["check_runs"].as_array()?;
+
+    for run in runs {
+        let name = run["name"].as_str().unwrap_or("");
+        let status = run["status"].as_str().unwrap_or("");
+        let conclusion = run["conclusion"].as_str().unwrap_or("");
+        let display = if status == "completed" { conclusion } else { status };
+        println!("{}\t{}", display, name);
+    }
+    Some(0)
+}
+
 // gh run list -R owner/repo
 fn try_run_list(args: &[String], base: &str) -> Option<i32> {
     let repo = repo_flag(args)?;
@@ -204,4 +248,102 @@ fn find_real_gh() -> String {
         }
     }
     "/usr/bin/gh".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn test_flag_val() {
+        let a = args(&["pr", "view", "123", "-R", "owner/repo"]);
+        assert_eq!(flag_val(&a, "-R"), Some("owner/repo".to_string()));
+        assert_eq!(flag_val(&a, "--repo"), None);
+    }
+
+    #[test]
+    fn test_repo_flag() {
+        let a = args(&["pr", "diff", "42", "--repo", "foo/bar"]);
+        assert_eq!(repo_flag(&a), Some("foo/bar".to_string()));
+
+        let a = args(&["pr", "diff", "42", "-R", "baz/qux"]);
+        assert_eq!(repo_flag(&a), Some("baz/qux".to_string()));
+    }
+
+    #[test]
+    fn test_repo_flag_missing() {
+        let a = args(&["pr", "diff", "42"]);
+        assert_eq!(repo_flag(&a), None);
+    }
+
+    #[test]
+    fn test_jq_extract_simple() {
+        let val: serde_json::Value = serde_json::json!({"name": "hello", "count": 42});
+        assert_eq!(jq_extract(&val, ".name"), "hello");
+        assert_eq!(jq_extract(&val, ".count"), "42");
+        assert_eq!(jq_extract(&val, ".missing"), "null");
+    }
+
+    #[test]
+    fn test_jq_extract_nested() {
+        let val: serde_json::Value = serde_json::json!({"head": {"sha": "abc123"}});
+        assert_eq!(jq_extract(&val, ".head.sha"), "abc123");
+    }
+
+    #[test]
+    fn test_try_pooled_returns_none_for_writes() {
+        // pr create, pr merge, etc. should not be handled
+        let a = args(&["pr", "create", "--title", "test"]);
+        assert_eq!(try_pooled(&a, "http://fake:8080"), None);
+
+        let a = args(&["pr", "merge", "123", "-R", "o/r"]);
+        assert_eq!(try_pooled(&a, "http://fake:8080"), None);
+    }
+
+    #[test]
+    fn test_try_pooled_returns_none_for_empty() {
+        let a: Vec<String> = vec![];
+        assert_eq!(try_pooled(&a, "http://fake:8080"), None);
+    }
+
+    #[test]
+    fn test_try_pr_diff_missing_repo() {
+        // No -R flag → returns None (falls through)
+        let a = args(&["pr", "diff", "123"]);
+        assert_eq!(try_pr_diff(&a, "http://unreachable:9999"), None);
+    }
+
+    #[test]
+    fn test_try_pr_diff_bad_number() {
+        let a = args(&["pr", "diff", "notanumber", "-R", "o/r"]);
+        assert_eq!(try_pr_diff(&a, "http://unreachable:9999"), None);
+    }
+
+    #[test]
+    fn test_try_pr_checks_missing_repo() {
+        let a = args(&["pr", "checks", "123"]);
+        assert_eq!(try_pr_checks(&a, "http://unreachable:9999"), None);
+    }
+
+    #[test]
+    fn test_try_pr_checks_bad_number() {
+        let a = args(&["pr", "checks", "abc", "-R", "o/r"]);
+        assert_eq!(try_pr_checks(&a, "http://unreachable:9999"), None);
+    }
+
+    #[test]
+    fn test_try_api_write_indicators_return_none() {
+        let a = args(&["api", "/repos/o/r/issues", "-X", "POST"]);
+        assert_eq!(try_api(&a, "http://fake:8080"), None);
+
+        let a = args(&["api", "/repos/o/r/issues", "-f", "title=x"]);
+        assert_eq!(try_api(&a, "http://fake:8080"), None);
+
+        let a = args(&["api", "graphql"]);
+        assert_eq!(try_api(&a, "http://fake:8080"), None);
+    }
 }

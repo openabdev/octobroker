@@ -944,11 +944,12 @@ dependencies = [
 
 [[package]]
 name = "ghpool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-config",
  "aws-sdk-secretsmanager",
  "axum",
+ "hyper 1.10.0",
  "moka",
  "reqwest",
  "serde",
@@ -956,6 +957,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

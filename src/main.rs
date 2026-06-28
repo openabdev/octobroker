@@ -19,6 +19,7 @@ struct AppState {
     cache: cache::Cache,
     config: config::Config,
     token_users: moka::future::Cache<String, String>,
+    http: reqwest::Client,
 }
 
 #[tokio::main]
@@ -39,12 +40,14 @@ async fn main() {
         cache,
         config: config.clone(),
         token_users: moka::future::Cache::builder().max_capacity(100).build(),
+        http: reqwest::Client::new(),
     });
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/graphql", post(graphql_proxy))
+        .route("/raw/{*path}", get(proxy_raw))
         .route("/{*path}", get(proxy))
         .with_state(state);
 
@@ -100,8 +103,7 @@ async fn proxy(
     }
 
     // Forward request
-    let client = reqwest::Client::new();
-    let mut req = client.get(&url)
+    let mut req = state.http.get(&url)
         .header("Authorization", format!("Bearer {}", identity.token))
         .header("User-Agent", "ghpool/0.1.0")
         .header("Accept", "application/vnd.github+json");
@@ -144,6 +146,65 @@ async fn proxy(
 
     tracing::info!("200 OK {} [via {}]", api_path, identity.id);
     Ok(Json(body))
+}
+
+async fn proxy_raw(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, HeaderMap, String), StatusCode> {
+    let api_path = format!("/{}", path);
+
+    if !is_allowed_path(&api_path, &state.config.allowed_owners) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let identity = state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let mut url = format!("https://api.github.com{}", api_path);
+    if !query.is_empty() {
+        let qs: Vec<String> = query.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        url = format!("{}?{}", url, qs.join("&"));
+    }
+
+    let accept = headers.get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/vnd.github.v3.diff");
+
+    let resp = state.http.get(&url)
+        .header("Authorization", format!("Bearer {}", identity.token))
+        .header("User-Agent", "ghpool/0.1.0")
+        .header("Accept", accept)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("github request failed: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let rate_remaining = resp.headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u32>().ok());
+    let rate_reset = resp.headers()
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    state.pool.update_rate(&identity.id, rate_remaining, rate_reset);
+
+    let status = resp.status();
+    let body = resp.text().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    if !status.is_success() {
+        tracing::warn!("github returned {}: {}", status, api_path);
+        return Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    }
+
+    tracing::info!("200 OK {} [raw, via {}]", api_path, identity.id);
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert("content-type", "text/plain".parse().unwrap());
+    Ok((StatusCode::OK, resp_headers, body))
 }
 
 fn is_allowed_path(path: &str, allowed_owners: &[String]) -> bool {
@@ -191,8 +252,7 @@ async fn graphql_proxy(
         (format!("Bearer {}", identity.token), identity.id.clone())
     };
 
-    let client = reqwest::Client::new();
-    let resp = client.post("https://api.github.com/graphql")
+    let resp = state.http.post("https://api.github.com/graphql")
         .header("Authorization", &auth_header)
         .header("User-Agent", "ghpool/0.1.0")
         .header("Content-Type", "application/json")
@@ -240,8 +300,7 @@ async fn resolve_token_user(state: &AppState, auth_header: &str) -> String {
     if let Some(user) = state.token_users.get(&key).await {
         return user;
     }
-    let client = reqwest::Client::new();
-    let user = match client.get("https://api.github.com/user")
+    let user = match state.http.get("https://api.github.com/user")
         .header("Authorization", auth_header)
         .header("User-Agent", "ghpool/0.1.0")
         .send()
@@ -256,4 +315,96 @@ async fn resolve_token_user(state: &AppState, auth_header: &str) -> String {
     };
     state.token_users.insert(key, user.clone()).await;
     user
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state(allowed_owners: Vec<&str>) -> Arc<AppState> {
+        let identities = vec![config::IdentityConfig {
+            id: "test".to_string(),
+            token: "fake-token".to_string(),
+        }];
+        let pool = pool::PatPool::new(&identities);
+        let cache_config = config::CacheConfig::default();
+        let cache = cache::Cache::new(&cache_config);
+        Arc::new(AppState {
+            pool,
+            cache,
+            config: config::Config {
+                port: 8080,
+                identities,
+                allowed_owners: allowed_owners.iter().map(|s| s.to_string()).collect(),
+                cache: cache_config,
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+        })
+    }
+
+    fn app(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route("/healthz", axum::routing::get(healthz))
+            .route("/stats", axum::routing::get(stats))
+            .route("/raw/{*path}", axum::routing::get(proxy_raw))
+            .route("/{*path}", axum::routing::get(proxy))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_healthz() {
+        let state = test_state(vec!["openabdev"]);
+        let resp = app(state)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_forbidden_owner() {
+        let state = test_state(vec!["openabdev"]);
+        let resp = app(state)
+            .oneshot(Request::builder().uri("/repos/evil-org/repo/pulls/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_raw_forbidden_owner() {
+        let state = test_state(vec!["openabdev"]);
+        let resp = app(state)
+            .oneshot(Request::builder().uri("/raw/repos/evil-org/repo/pulls/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_allowed_non_repo_path() {
+        // Non-repo paths like /rate_limit are allowed (will fail at GitHub but not 403)
+        let state = test_state(vec!["openabdev"]);
+        let resp = app(state)
+            .oneshot(Request::builder().uri("/rate_limit").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        // Will be BAD_GATEWAY since fake token can't reach GitHub, but NOT FORBIDDEN
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_is_allowed_path() {
+        let owners = vec!["openabdev".to_string(), "oablab".to_string()];
+        assert!(is_allowed_path("/repos/openabdev/ghpool/pulls/1", &owners));
+        assert!(is_allowed_path("/repos/oablab/chi/issues", &owners));
+        assert!(!is_allowed_path("/repos/evil/repo/pulls/1", &owners));
+        // Non-repo paths are allowed
+        assert!(is_allowed_path("/rate_limit", &owners));
+        assert!(is_allowed_path("/user", &owners));
+    }
 }
