@@ -184,7 +184,7 @@ async fn proxy_raw(
     let identity_id = identity.id.clone();
     let api_path_for_log = api_path.clone();
 
-    let result = state.cache.get_or_insert_raw(&cache_key, || async move {
+    let result = state.cache.get_or_insert_raw(&cache_key, async move {
         let resp = state_for_fetch.http.get(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("User-Agent", "ghpool/0.1.0")

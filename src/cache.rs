@@ -48,8 +48,8 @@ impl Cache {
         // tracks weighted bytes, not entry count.
         let raw_store = MokaCache::builder()
             .max_capacity(config.raw_max_bytes)
-            .weigher(move |_key: &String, value: &String| -> u32 {
-                value.len().min(u32::MAX as usize) as u32
+            .weigher(move |key: &String, value: &String| -> u32 {
+                (key.len() + value.len()).min(u32::MAX as usize) as u32
             })
             .time_to_live(Duration::from_secs(config.raw_ttl_secs))
             .build();
@@ -113,22 +113,26 @@ impl Cache {
     }
 
     /// Fetch-or-compute with stampede protection: concurrent callers with the
-    /// same key share a single in-flight future via moka's `try_get_with`,
+    /// same key share a single in-flight future via moka's `entry` API,
     /// so N simultaneous cache misses only trigger one upstream request.
-    pub async fn get_or_insert_raw<F, Fut, E>(
+    /// Uses `is_fresh()` to correctly distinguish hits from misses.
+    pub async fn get_or_insert_raw<F, E>(
         &self,
         key: &str,
         init: F,
     ) -> Result<String, E>
     where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<String, E>>,
+        F: std::future::Future<Output = Result<String, E>>,
         E: Clone + std::fmt::Debug + Send + Sync + 'static,
     {
-        match self.raw_store.try_get_with(key.to_string(), init()).await {
-            Ok(v) => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Ok(v)
+        match self.raw_store.entry_by_ref(key).or_try_insert_with(init).await {
+            Ok(entry) => {
+                if entry.is_fresh() {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(entry.into_value())
             }
             Err(e) => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -261,17 +265,20 @@ mod tests {
         let call_count = std::sync::Arc::new(AtomicU64::new(0));
         let cc1 = call_count.clone();
         let v1 = cache
-            .get_or_insert_raw(&key, || async move {
+            .get_or_insert_raw(&key, async move {
                 cc1.fetch_add(1, Ordering::SeqCst);
                 Ok::<String, String>("diff content".to_string())
             })
             .await
             .unwrap();
         assert_eq!(v1, "diff content");
+        // First call should be a miss (fresh insert).
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 0);
         // Second call should hit cache, not invoke init again.
         let cc2 = call_count.clone();
         let v2 = cache
-            .get_or_insert_raw(&key, || async move {
+            .get_or_insert_raw(&key, async move {
                 cc2.fetch_add(1, Ordering::SeqCst);
                 Ok::<String, String>("should not be used".to_string())
             })
@@ -279,12 +286,14 @@ mod tests {
             .unwrap();
         assert_eq!(v2, "diff content");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 1);
     }
 
     #[tokio::test]
     async fn test_cache_raw_stampede_dedup() {
         // Concurrent callers requesting the same uncached key should only
-        // trigger the init closure once (moka's try_get_with coalesces).
+        // trigger the init closure once (moka's entry API coalesces).
         let cfg = CacheConfig::default();
         let cache = std::sync::Arc::new(Cache::new(&cfg));
         let call_count = std::sync::Arc::new(AtomicU64::new(0));
@@ -297,7 +306,7 @@ mod tests {
             let key = key.clone();
             handles.push(tokio::spawn(async move {
                 cache
-                    .get_or_insert_raw(&key, || async move {
+                    .get_or_insert_raw(&key, async move {
                         call_count.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         Ok::<String, String>("diff".to_string())
@@ -308,6 +317,11 @@ mod tests {
         for h in handles {
             h.await.unwrap().unwrap();
         }
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "init should only run once for concurrent misses on the same key");
+        // With entry API, all concurrent calls coalesce: only 1 init runs.
+        // The one that evaluated is_fresh()=true counts as a miss.
+        // The rest see is_fresh()=false and count as hits.
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 1, "only one call should be a miss (the one that ran init)");
+        assert_eq!(stats.hits, 9, "the rest should be hits (served from cache after init completed)");
     }
 }
