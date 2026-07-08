@@ -41,10 +41,24 @@ impl Cache {
             .max_capacity(config.max_entries)
             .time_to_live(Duration::from_secs(config.default_ttl_secs))
             .build();
+        // Raw (diff/patch) cache: bounded primarily by total bytes via a
+        // weigher, since diff bodies can be multi-MB (unlike JSON metadata
+        // responses). `raw_max_entries` is retained in config for operators
+        // who want to reason about entry count, but moka's max_capacity here
+        // tracks weighted bytes, not entry count.
         let raw_store = MokaCache::builder()
-            .max_capacity(config.max_entries / 2)
-            .time_to_live(Duration::from_secs(30))
+            .max_capacity(config.raw_max_bytes)
+            .weigher(move |_key: &String, value: &String| -> u32 {
+                value.len().min(u32::MAX as usize) as u32
+            })
+            .time_to_live(Duration::from_secs(config.raw_ttl_secs))
             .build();
+        tracing::debug!(
+            raw_max_bytes = config.raw_max_bytes,
+            raw_max_entries_hint = config.raw_max_entries,
+            raw_ttl_secs = config.raw_ttl_secs,
+            "raw cache configured"
+        );
         Self {
             store,
             raw_store,
@@ -98,21 +112,29 @@ impl Cache {
         }
     }
 
-    pub async fn get_raw(&self, key: &str) -> Option<String> {
-        match self.raw_store.get(key).await {
-            Some(v) => {
+    /// Fetch-or-compute with stampede protection: concurrent callers with the
+    /// same key share a single in-flight future via moka's `try_get_with`,
+    /// so N simultaneous cache misses only trigger one upstream request.
+    pub async fn get_or_insert_raw<F, Fut, E>(
+        &self,
+        key: &str,
+        init: F,
+    ) -> Result<String, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, E>>,
+        E: Clone + std::fmt::Debug + Send + Sync + 'static,
+    {
+        match self.raw_store.try_get_with(key.to_string(), init()).await {
+            Ok(v) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(v)
+                Ok(v)
             }
-            None => {
+            Err(e) => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
-                None
+                Err((*e).clone())
             }
         }
-    }
-
-    pub async fn insert_raw(&self, key: &str, value: &str) {
-        self.raw_store.insert(key.to_string(), value.to_string()).await;
     }
 }
 
@@ -130,8 +152,28 @@ pub fn build_key(path: &str, query: &HashMap<String, String>) -> String {
     if qs.is_empty() { path.to_string() } else { format!("{}?{}", path, qs) }
 }
 
-pub fn build_raw_key(path: &str, accept: &str) -> String {
-    format!("raw:{}:{}", path, accept)
+/// Build a cache key for raw (non-JSON) responses.
+///
+/// Includes:
+/// - `path` + sorted `query` params (consistent with `build_key`, fixes a gap
+///   where paginated raw requests would previously collide on the same key)
+/// - normalized `accept` header (lowercased, so `Application/Vnd.Github.V3.Diff`
+///   and `application/vnd.github.v3.diff` share one cache entry)
+/// - `identity_scope`: a caller-supplied token identifying which PAT/identity's
+///   access scope produced the response. This prevents cross-identity leakage
+///   when the pool holds PATs with different repo access — a response fetched
+///   with a broadly-scoped PAT must never be served to a caller whose own PAT
+///   would have been denied access.
+pub fn build_raw_key(path: &str, query: &HashMap<String, String>, accept: &str, identity_scope: &str) -> String {
+    let mut parts: Vec<(&str, &str)> = query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    parts.sort();
+    let qs: String = parts.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+    let normalized_accept = accept.trim().to_ascii_lowercase();
+    if qs.is_empty() {
+        format!("raw:{}:{}:{}", path, normalized_accept, identity_scope)
+    } else {
+        format!("raw:{}?{}:{}:{}", path, qs, normalized_accept, identity_scope)
+    }
 }
 
 pub fn build_graphql_key(body: &[u8]) -> String {
@@ -154,5 +196,118 @@ pub fn classify_route(path: &str) -> RouteKind {
         },
         _ if parts.len() == 4 => RouteKind::RepoView,
         _ => RouteKind::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_query() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn test_build_raw_key_no_query() {
+        let key = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        assert_eq!(key, "raw:/repos/o/r/pulls/1:application/vnd.github.v3.diff:id1");
+    }
+
+    #[test]
+    fn test_build_raw_key_normalizes_accept_case() {
+        let a = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "Application/Vnd.Github.V3.Diff", "id1");
+        let b = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_build_raw_key_includes_query_params() {
+        let mut q = HashMap::new();
+        q.insert("page".to_string(), "2".to_string());
+        let key = build_raw_key("/repos/o/r/pulls/1", &q, "application/vnd.github.v3.diff", "id1");
+        assert_eq!(key, "raw:/repos/o/r/pulls/1?page=2:application/vnd.github.v3.diff:id1");
+    }
+
+    #[test]
+    fn test_build_raw_key_differs_by_query() {
+        let mut q1 = HashMap::new();
+        q1.insert("page".to_string(), "1".to_string());
+        let mut q2 = HashMap::new();
+        q2.insert("page".to_string(), "2".to_string());
+        let k1 = build_raw_key("/repos/o/r/pulls/1", &q1, "application/vnd.github.v3.diff", "id1");
+        let k2 = build_raw_key("/repos/o/r/pulls/1", &q2, "application/vnd.github.v3.diff", "id1");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_build_raw_key_differs_by_identity_scope() {
+        let k1 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        let k2 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id2");
+        assert_ne!(k1, k2, "responses from different identity scopes must not share a cache entry");
+    }
+
+    #[test]
+    fn test_build_raw_key_differs_by_accept() {
+        let k1 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        let k2 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/json", "id1");
+        assert_ne!(k1, k2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_raw_get_insert_roundtrip() {
+        let cfg = CacheConfig::default();
+        let cache = Cache::new(&cfg);
+        let key = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        let call_count = std::sync::Arc::new(AtomicU64::new(0));
+        let cc1 = call_count.clone();
+        let v1 = cache
+            .get_or_insert_raw(&key, || async move {
+                cc1.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, String>("diff content".to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(v1, "diff content");
+        // Second call should hit cache, not invoke init again.
+        let cc2 = call_count.clone();
+        let v2 = cache
+            .get_or_insert_raw(&key, || async move {
+                cc2.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, String>("should not be used".to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(v2, "diff content");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_raw_stampede_dedup() {
+        // Concurrent callers requesting the same uncached key should only
+        // trigger the init closure once (moka's try_get_with coalesces).
+        let cfg = CacheConfig::default();
+        let cache = std::sync::Arc::new(Cache::new(&cfg));
+        let call_count = std::sync::Arc::new(AtomicU64::new(0));
+        let key = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let cache = cache.clone();
+            let call_count = call_count.clone();
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                cache
+                    .get_or_insert_raw(&key, || async move {
+                        call_count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok::<String, String>("diff".to_string())
+                    })
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "init should only run once for concurrent misses on the same key");
     }
 }

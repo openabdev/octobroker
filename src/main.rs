@@ -162,18 +162,16 @@ async fn proxy_raw(
 
     let accept = headers.get("accept")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/vnd.github.v3.diff");
+        .unwrap_or("application/vnd.github.v3.diff")
+        .to_string();
 
-    // Check raw cache
-    let cache_key = cache::build_raw_key(&api_path, accept);
-    if let Some(cached) = state.cache.get_raw(&cache_key).await {
-        tracing::info!("200 OK {} [raw, cache HIT]", api_path);
-        let mut resp_headers = HeaderMap::new();
-        resp_headers.insert("content-type", "text/plain".parse().unwrap());
-        return Ok((StatusCode::OK, resp_headers, cached));
-    }
-
+    // Select the identity BEFORE checking the cache. The cache key is scoped
+    // to this identity so a response fetched under one PAT's access scope is
+    // never served to a caller that would resolve to a different identity
+    // (prevents cross-identity leakage when the pool holds PATs with
+    // different repo access).
     let identity = state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let cache_key = cache::build_raw_key(&api_path, &query, &accept, &identity.id);
 
     let mut url = format!("https://api.github.com{}", api_path);
     if !query.is_empty() {
@@ -181,42 +179,59 @@ async fn proxy_raw(
         url = format!("{}?{}", url, qs.join("&"));
     }
 
-    let resp = state.http.get(&url)
-        .header("Authorization", format!("Bearer {}", identity.token))
-        .header("User-Agent", "ghpool/0.1.0")
-        .header("Accept", accept)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("github request failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    let state_for_fetch = state.clone();
+    let token = identity.token.clone();
+    let identity_id = identity.id.clone();
+    let api_path_for_log = api_path.clone();
 
-    let rate_remaining = resp.headers()
-        .get("x-ratelimit-remaining")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u32>().ok());
-    let rate_reset = resp.headers()
-        .get("x-ratelimit-reset")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    state.pool.update_rate(&identity.id, rate_remaining, rate_reset);
+    let result = state.cache.get_or_insert_raw(&cache_key, || async move {
+        let resp = state_for_fetch.http.get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("User-Agent", "ghpool/0.1.0")
+            .header("Accept", &accept)
+            .send()
+            .await
+            .map_err(|e| format!("github request failed: {e}"))?;
 
-    let status = resp.status();
-    let body = resp.text().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let rate_remaining = resp.headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+        let rate_reset = resp.headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        state_for_fetch.pool.update_rate(&identity_id, rate_remaining, rate_reset);
 
-    if !status.is_success() {
-        tracing::warn!("github returned {}: {}", status, api_path);
-        return Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+        let status = resp.status();
+        let body = resp.text().await.map_err(|_| "failed to read response body".to_string())?;
+
+        if !status.is_success() {
+            tracing::warn!("github returned {}: {}", status, api_path_for_log);
+            // Encode the status so the caller can map it back to an HTTP error.
+            return Err(format!("upstream_status:{}", status.as_u16()));
+        }
+
+        Ok(body)
+    }).await;
+
+    match result {
+        Ok(body) => {
+            tracing::info!("200 OK {} [raw, via {}]", api_path, identity.id);
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("content-type", "text/plain".parse().unwrap());
+            Ok((StatusCode::OK, resp_headers, body))
+        }
+        Err(e) => {
+            if let Some(code_str) = e.strip_prefix("upstream_status:") {
+                if let Ok(code) = code_str.parse::<u16>() {
+                    return Err(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY));
+                }
+            }
+            tracing::error!("raw proxy failed: {}", e);
+            Err(StatusCode::BAD_GATEWAY)
+        }
     }
-
-    // Cache the raw response (30s TTL)
-    state.cache.insert_raw(&cache_key, &body).await;
-
-    tracing::info!("200 OK {} [raw, via {}]", api_path, identity.id);
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert("content-type", "text/plain".parse().unwrap());
-    Ok((StatusCode::OK, resp_headers, body))
 }
 
 fn is_allowed_path(path: &str, allowed_owners: &[String]) -> bool {
