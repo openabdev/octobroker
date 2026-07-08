@@ -20,6 +20,7 @@ pub enum RouteKind {
 
 pub struct Cache {
     store: MokaCache<String, Value>,
+    raw_store: MokaCache<String, String>,
     ttls: CacheTtls,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -40,8 +41,13 @@ impl Cache {
             .max_capacity(config.max_entries)
             .time_to_live(Duration::from_secs(config.default_ttl_secs))
             .build();
+        let raw_store = MokaCache::builder()
+            .max_capacity(config.max_entries / 2)
+            .time_to_live(Duration::from_secs(30))
+            .build();
         Self {
             store,
+            raw_store,
             ttls: CacheTtls {
                 pr_view: Duration::from_secs(config.pr_view_ttl_secs),
                 issue_list: Duration::from_secs(config.issue_list_ttl_secs),
@@ -88,8 +94,25 @@ impl Cache {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
-            entries: self.store.entry_count(),
+            entries: self.store.entry_count() + self.raw_store.entry_count(),
         }
+    }
+
+    pub async fn get_raw(&self, key: &str) -> Option<String> {
+        match self.raw_store.get(key).await {
+            Some(v) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(v)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    pub async fn insert_raw(&self, key: &str, value: &str) {
+        self.raw_store.insert(key.to_string(), value.to_string()).await;
     }
 }
 
@@ -105,6 +128,10 @@ pub fn build_key(path: &str, query: &HashMap<String, String>) -> String {
     parts.sort();
     let qs: String = parts.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
     if qs.is_empty() { path.to_string() } else { format!("{}?{}", path, qs) }
+}
+
+pub fn build_raw_key(path: &str, accept: &str) -> String {
+    format!("raw:{}:{}", path, accept)
 }
 
 pub fn build_graphql_key(body: &[u8]) -> String {

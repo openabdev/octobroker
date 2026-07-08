@@ -160,6 +160,19 @@ async fn proxy_raw(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let accept = headers.get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/vnd.github.v3.diff");
+
+    // Check raw cache
+    let cache_key = cache::build_raw_key(&api_path, accept);
+    if let Some(cached) = state.cache.get_raw(&cache_key).await {
+        tracing::info!("200 OK {} [raw, cache HIT]", api_path);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("content-type", "text/plain".parse().unwrap());
+        return Ok((StatusCode::OK, resp_headers, cached));
+    }
+
     let identity = state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     let mut url = format!("https://api.github.com{}", api_path);
@@ -167,10 +180,6 @@ async fn proxy_raw(
         let qs: Vec<String> = query.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         url = format!("{}?{}", url, qs.join("&"));
     }
-
-    let accept = headers.get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/vnd.github.v3.diff");
 
     let resp = state.http.get(&url)
         .header("Authorization", format!("Bearer {}", identity.token))
@@ -200,6 +209,9 @@ async fn proxy_raw(
         tracing::warn!("github returned {}: {}", status, api_path);
         return Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
     }
+
+    // Cache the raw response (30s TTL)
+    state.cache.insert_raw(&cache_key, &body).await;
 
     tracing::info!("200 OK {} [raw, via {}]", api_path, identity.id);
     let mut resp_headers = HeaderMap::new();
