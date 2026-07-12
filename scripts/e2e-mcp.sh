@@ -16,7 +16,9 @@ set -uo pipefail
 BIN="${GHPOOL_BIN:-./target/debug/ghpool}"
 WORKDIR="$(mktemp -d)"
 LOG="${WORKDIR}/ghpool.log"
-CURL=(curl -s --connect-timeout 5 --max-time 30)
+# --max-time must exceed ghpool's upstream POST timeout (120s) so a slow but
+# healthy upstream call is not cut off client-side.
+CURL=(curl -s --connect-timeout 5 --max-time 130)
 
 pass=0
 fail=0
@@ -45,7 +47,9 @@ fi
 
 # Pick a free port to avoid CI collisions
 PORT="${PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')}"
-BASE="http://localhost:${PORT}"
+# Bind and connect over IPv4 explicitly: ghpool binds 0.0.0.0, but "localhost"
+# can resolve to ::1 on dual-stack hosts and fail to connect.
+BASE="http://127.0.0.1:${PORT}"
 
 cat > "${WORKDIR}/config.toml" <<EOF
 port = ${PORT}
@@ -69,8 +73,16 @@ done
 
 JSON_H=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
-# Extract the JSON payload from an SSE response body (last data: frame)
-sse_json() { grep "^data:" "$1" | sed 's/^data: //' | tail -1; }
+# Extract the JSON payload from a response body. Handles both SSE framing
+# (one or more `data:` lines; the space after the colon is optional per spec)
+# and a plain application/json body.
+sse_json() {
+  if grep -q "^data:" "$1"; then
+    grep "^data:" "$1" | sed 's/^data: \{0,1\}//' | tail -1
+  else
+    cat "$1"
+  fi
+}
 
 # jq_ok <filter> <file> — true if the filter matches; jq's own stdout is
 # suppressed internally so it does not swallow check()'s result line.
@@ -86,7 +98,12 @@ check "Mcp-Session-Id returned" test -n "${SID}"
 sse_json "${WORKDIR}/init-body.txt" > "${WORKDIR}/init.json"
 check "initialize result frame streamed" jq_ok '.result.capabilities' "${WORKDIR}/init.json"
 
-SESS_H=(-H "Mcp-Session-Id: ${SID}")
+# Per MCP Streamable HTTP spec, subsequent requests carry the negotiated
+# protocol version as an HTTP header (from the initialize response, falling
+# back to what we requested).
+PROTO="$(grep -i "^mcp-protocol-version:" "${WORKDIR}/init-headers.txt" | tr -d '\r' | awk '{print $2}')"
+PROTO="${PROTO:-2025-06-18}"
+SESS_H=(-H "Mcp-Session-Id: ${SID}" -H "MCP-Protocol-Version: ${PROTO}")
 
 echo "2. notifications/initialized"
 CODE="$("${CURL[@]}" -o /dev/null -w "%{http_code}" -X POST "${BASE}/mcp" "${JSON_H[@]}" "${SESS_H[@]}" \
@@ -126,7 +143,7 @@ check "unknown session → 404 (got ${CODE})" test "${CODE}" = "404"
 
 echo "7. DELETE terminates session"
 CODE="$("${CURL[@]}" -o /dev/null -w "%{http_code}" -X DELETE "${BASE}/mcp" "${SESS_H[@]}")"
-check "DELETE accepted (got ${CODE})" test "${CODE}" != "000"
+check "DELETE accepted 2xx (got ${CODE})" test "${CODE}" = "200" -o "${CODE}" = "202" -o "${CODE}" = "204"
 CODE="$("${CURL[@]}" -o /dev/null -w "%{http_code}" -X POST "${BASE}/mcp" "${JSON_H[@]}" "${SESS_H[@]}" \
   -d '{"jsonrpc":"2.0","id":5,"method":"tools/list"}')"
 check "terminated session unpinned → 404 (got ${CODE})" test "${CODE}" = "404"

@@ -17,6 +17,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege: read the repo, write only workflow artifacts (the log).
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   e2e-mcp:
     runs-on: ubuntu-latest
