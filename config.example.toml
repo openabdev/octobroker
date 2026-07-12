@@ -28,6 +28,11 @@ run_list_ttl_secs = 15
 commit_list_ttl_secs = 120
 repo_view_ttl_secs = 300
 default_ttl_secs = 60
+# Raw (non-JSON) response cache — used for `gh pr diff`, patches, etc.
+# Scoped per (path, query, Accept header, identity) to avoid cross-identity
+# leakage and to correctly distinguish paginated/variant requests.
+raw_ttl_secs = 30
+raw_max_bytes = 268435456  # 256 MiB — total byte budget, enforced via weigher
 
 # MCP reverse proxy (Phase 1: read-only) — https://github.com/openabdev/ghpool/issues/15
 # When enabled, ghpool proxies MCP Streamable HTTP traffic on /mcp to GitHub's
