@@ -1,13 +1,17 @@
 # ghpool
 
-A secure, cloud-native GitHub API proxy that pools PATs for rate limit sharing, caches read responses, and passes through mutations — built for coding agents running in private networks.
+A secure, cloud-native GitHub gateway for AI coding agents: agents get GitHub's official MCP tools and REST reads **without holding any GitHub credential** — ghpool authenticates each agent, enforces per-agent default-deny tool/repo policy, and injects short-lived, repo-scoped GitHub App tokens upstream. Read caching and PAT pooling included for high-throughput REST traffic.
+
+> Design: [docs/DESIGN.md](docs/DESIGN.md) · Onboarding: [docs/getting-started.md](docs/getting-started.md) · RFC history: [#15](https://github.com/openabdev/ghpool/issues/15)
 
 ## Design Principles
 
+- **No GitHub credential on the agent** — agents hold at most a ghpool API key (revocable, policy-bounded, not a GitHub credential). The GitHub credentials live in exactly one place: ghpool.
+- **Default-deny policy engine** — each agent gets an exact tool allowlist and repository allowlist; new upstream tools are denied until explicitly granted. GitHub's own scoped installation tokens enforce the repo boundary independently of ghpool's parsing.
+- **Short-lived credentials first** — GitHub App installation tokens (1h, auto-refreshed, repo-scoped at mint) are the recommended backend. Long-lived PAT pooling remains for REST read caching and legacy setups.
 - **Cloud-native** — runs on any Kubernetes (Amazon EKS, Google Cloud GKE, self-managed k8s) and Amazon ECS. Single static binary, no runtime dependencies.
-- **Built for agents, not humans** — optimized for high-throughput, concurrent API access from multiple coding agents sharing the same repos.
-- **Secrets-first** — credentials are resolved at runtime from AWS Secrets Manager, Google Cloud Secret Manager, or Kubernetes secrets. No plain text tokens stored at rest or in transit.
-- **Private network isolation** — designed to run inside your trusted network (on-premises, cloud VPC, or service mesh). No public endpoints, no external dependencies beyond GitHub API.
+- **Secrets-first** — credentials are resolved at runtime from AWS Secrets Manager or Kubernetes secrets. No plain text tokens at rest.
+- **Private network isolation** — designed to run inside your trusted network (VPC, service mesh). No public endpoints; egress only to GitHub.
 
 ## Architecture
 
@@ -22,28 +26,32 @@ A secure, cloud-native GitHub API proxy that pools PATs for rate limit sharing, 
 │       └──────────────┼──────────────┘                               │
 │                      │                                              │
 │                      ▼                                              │
-│            ┌───────────────────┐                                    │
-│            │      ghpool       │                                    │
-│            │                   │                                    │
-│            │  ┌─────────────┐  │      ┌──────────────────────┐      │
-│            │  │  PAT Pool   │  │      │  Secrets Manager     │      │
-│            │  │             │◄─┼──────│  (AWS/K8s/Env)       │      │
-│            │  │ chaodu: 4998│  │      └──────────────────────┘      │
-│            │  │ thepagent:  │  │                                    │
-│            │  │         1889│  │                                    │
-│            │  └─────────────┘  │                                    │
-│            │  ┌─────────────┐  │                                    │
-│            │  │    Cache    │  │                                    │
-│            │  │  (in-mem)   │  │                                    │
-│            │  └─────────────┘  │                                    │
-│            └────────┬──────────┘                                    │
-│                     │                                               │
-└─────────────────────┼───────────────────────────────────────────────┘
-                      │
-                      ▼
-            ┌───────────────────┐
-            │  api.github.com   │
-            └───────────────────┘
+│           ┌──────────────────────────────────┐                      │
+│           │              ghpool              │                      │
+│           │                                  │                      │
+│           │  ┌────────────────────────────┐  │                      │
+│           │  │ Agent authn (X-Ghpool-Key) │  │                      │
+│           │  │ + default-deny policy      │  │  ┌────────────────┐  │
+│           │  │   tools / repos per agent  │  │  │ Secrets Manager│  │
+│           │  └────────────────────────────┘  │  │ (AWS/K8s/Env)  │  │
+│           │  ┌─────────────┐ ┌────────────┐  │  └───────┬────────┘  │
+│           │  │ GitHub App  │ │  PAT Pool  │◄─┼──────────┘           │
+│           │  │ tokens (1h, │ │ (REST read │  │                      │
+│           │  │ repo-scoped)│ │  budget)   │  │                      │
+│           │  └─────────────┘ └────────────┘  │                      │
+│           │  ┌─────────────┐ ┌────────────┐  │                      │
+│           │  │ Fail-closed │ │   Cache    │  │                      │
+│           │  │ write audit │ │  (in-mem)  │  │                      │
+│           │  └─────────────┘ └────────────┘  │                      │
+│           └───────┬──────────────────┬───────┘                      │
+│                   │                  │                              │
+└───────────────────┼──────────────────┼──────────────────────────────┘
+                    │                  │
+                    ▼                  ▼
+        ┌─────────────────────┐  ┌───────────────────┐
+        │ api.githubcopilot   │  │  api.github.com   │
+        │ .com/mcp/  (MCP)    │  │  (REST/GraphQL)   │
+        └─────────────────────┘  └───────────────────┘
 
 Request Flow:
 
