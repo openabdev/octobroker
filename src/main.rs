@@ -1,3 +1,4 @@
+mod app_token;
 mod cache;
 mod config;
 mod mcp;
@@ -24,6 +25,9 @@ struct AppState {
     http: reqwest::Client,
     /// MCP session pinning: Mcp-Session-Id → (pooled identity, agent binding)
     mcp_sessions: moka::future::Cache<String, mcp::SessionPin>,
+    /// GitHub App installation token provider for the MCP path (2b).
+    /// None = PAT pool backend.
+    app_tokens: Option<app_token::AppTokenProvider>,
 }
 
 #[tokio::main]
@@ -39,6 +43,20 @@ async fn main() {
     let pool = pool::PatPool::new(&config.identities);
     let cache = cache::Cache::new(&config.cache);
 
+    let app_tokens = config.mcp.github_app.as_ref().map(|app| {
+        app_token::AppTokenProvider::new(
+            app.app_id.clone(),
+            &app.private_key,
+            app.installation_id,
+            app.owner.clone(),
+            "https://api.github.com".to_string(),
+        )
+        .expect("invalid [mcp.github_app] config")
+    });
+    if app_tokens.is_some() {
+        tracing::info!("MCP credential backend: GitHub App installation tokens");
+    }
+
     let state = Arc::new(AppState {
         pool,
         cache,
@@ -49,6 +67,7 @@ async fn main() {
             .max_capacity(10_000)
             .time_to_idle(std::time::Duration::from_secs(config.mcp.session_ttl_secs))
             .build(),
+        app_tokens,
     });
 
     let mut app = Router::new()
@@ -392,6 +411,7 @@ mod tests {
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
+            app_tokens: None,
         })
     }
 

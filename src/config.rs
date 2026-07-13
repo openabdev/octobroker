@@ -79,6 +79,27 @@ pub struct McpConfig {
     /// Non-empty = every /mcp request must present a valid X-Ghpool-Key.
     #[serde(default)]
     pub agents: Vec<McpAgentConfig>,
+    /// GitHub App credential backend (Phase 2b). When configured, the MCP
+    /// path injects short-lived installation tokens instead of pooled PATs.
+    #[serde(default)]
+    pub github_app: Option<GithubAppConfig>,
+}
+
+/// GitHub App credentials for the MCP path.
+#[derive(Clone, Deserialize)]
+pub struct GithubAppConfig {
+    pub app_id: String,
+    /// App private key PEM. Supports the same secret references as tokens
+    /// (env:/aws:secretsmanager:/k8s:), resolved at config load. For env/
+    /// file sources the PEM may use literal "\n" escapes.
+    pub private_key: String,
+    /// Explicit installation id. Either this or `owner` is required.
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+    /// Org or user whose installation to discover (used when
+    /// installation_id is not set).
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// One authenticated MCP agent: key(s) → identity → tool allowlist.
@@ -115,6 +136,7 @@ impl Default for McpConfig {
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
             agents: Vec::new(),
+            github_app: None,
         }
     }
 }
@@ -238,6 +260,11 @@ impl Config {
                 panic!("mcp agent '{}' has no key/keys configured", agent.id);
             }
             agent.keys = resolved;
+        }
+        if let Some(app) = &mut mcp.github_app {
+            let pem = resolve_secret(&app.private_key).await;
+            // Env vars / JSON secrets often carry the PEM with literal \n
+            app.private_key = pem.replace("\\n", "\n");
         }
         Config {
             port: raw.port,

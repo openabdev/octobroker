@@ -34,8 +34,9 @@ check() {
 
 cleanup() {
   [ -n "${GHPOOL_PID:-}" ] && kill "${GHPOOL_PID}" 2>/dev/null
-  # Preserve the server log for CI artifact upload on failure
+  # Preserve the server logs for CI artifact upload on failure
   [ "${fail:-1}" -gt 0 ] && [ -f "${LOG}" ] && cp "${LOG}" ./ghpool-e2e.log 2>/dev/null
+  [ "${fail:-1}" -gt 0 ] && [ -f "${WORKDIR}/ghpool-app.log" ] && cp "${WORKDIR}/ghpool-app.log" ./ghpool-e2e-app.log 2>/dev/null
   rm -rf "${WORKDIR}"
 }
 trap cleanup EXIT
@@ -149,8 +150,56 @@ CODE="$("${CURL[@]}" -o /dev/null -w "%{http_code}" -X POST "${BASE}/mcp" "${JSO
 check "terminated session unpinned → 404 (got ${CODE})" test "${CODE}" = "404"
 
 echo "8. server-side behavior"
-check "session pinned in audit log" grep -q "MCP session pinned to identity e2e" "${LOG}"
+check "session pinned in audit log" grep -q "MCP session pinned" "${LOG}"
 check "tools/call audit-logged" grep -q "MCP tools/call issue_read" "${LOG}"
+
+# ── Optional: GitHub App credential backend mode (2b) ────────────────────
+# Runs when App credentials are provided (CI passes the repo secrets).
+if [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ]; then
+  echo "9. App-backend mode (ghpool mints installation tokens itself)"
+  APP_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  APP_BASE="http://127.0.0.1:${APP_PORT}"
+  APP_LOG="${WORKDIR}/ghpool-app.log"
+  cat > "${WORKDIR}/config-app.toml" <<EOF
+port = ${APP_PORT}
+allowed_owners = ["openabdev"]
+[mcp]
+enabled = true
+[mcp.github_app]
+app_id = "${APP_ID}"
+private_key = "env:APP_PRIVATE_KEY"
+owner = "openabdev"
+EOF
+  GHPOOL_CONFIG="${WORKDIR}/config-app.toml" "${BIN}" > "${APP_LOG}" 2>&1 &
+  APP_PID=$!
+  trap '[ -n "${APP_PID:-}" ] && kill "${APP_PID}" 2>/dev/null; cleanup' EXIT
+
+  for _ in $(seq 1 20); do
+    "${CURL[@]}" -f "${APP_BASE}/healthz" > /dev/null 2>&1 && break
+    sleep 0.5
+  done
+  "${CURL[@]}" -f "${APP_BASE}/healthz" > /dev/null || { echo "app-mode ghpool failed to start"; cat "${APP_LOG}"; exit 1; }
+
+  "${CURL[@]}" -D "${WORKDIR}/app-init-h.txt" -o "${WORKDIR}/app-init-b.txt" \
+    -X POST "${APP_BASE}/mcp" "${JSON_H[@]}" \
+    -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ghpool-e2e-app","version":"0"}}}'
+  check "app-mode initialize returns 200" grep -q "^HTTP/1.1 200" "${WORKDIR}/app-init-h.txt"
+  ASID="$(grep -i "^mcp-session-id:" "${WORKDIR}/app-init-h.txt" | tr -d '\r' | awk '{print $2}')"
+  check "app-mode session established" test -n "${ASID}"
+  check "installation token minted" grep -q "minted GitHub App installation token" "${APP_LOG}"
+  check "session pinned to App credential" grep -q "MCP session pinned to credential github-app" "${APP_LOG}"
+
+  "${CURL[@]}" -X POST "${APP_BASE}/mcp" "${JSON_H[@]}" -H "Mcp-Session-Id: ${ASID}" -H "MCP-Protocol-Version: ${PROTO}" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"method":"get","owner":"openabdev","repo":"ghpool","issue_number":15}}}' \
+    -o "${WORKDIR}/app-issue-raw.txt"
+  sse_json "${WORKDIR}/app-issue-raw.txt" > "${WORKDIR}/app-issue.json"
+  check "app-mode issue_read works" \
+    jq_ok '.result.content[0].text | fromjson | .number == 15' "${WORKDIR}/app-issue.json"
+
+  kill "${APP_PID}" 2>/dev/null; APP_PID=""
+else
+  echo "9. App-backend mode skipped (APP_ID/APP_PRIVATE_KEY not set)"
+fi
 
 echo
 echo "e2e result: ${pass} passed, ${fail} failed"

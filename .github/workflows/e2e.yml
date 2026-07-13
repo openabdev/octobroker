@@ -51,11 +51,16 @@ jobs:
       - name: e2e — MCP reverse proxy against hosted endpoint
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          # App-backend mode section (ghpool mints its own tokens)
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
         run: ./scripts/e2e-mcp.sh
       - name: Upload ghpool server log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: ghpool-e2e-log
-          path: ghpool-e2e.log
+          path: |
+            ghpool-e2e.log
+            ghpool-e2e-app.log
           if-no-files-found: ignore

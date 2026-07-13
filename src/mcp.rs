@@ -74,8 +74,8 @@ pub async fn mcp_proxy(
     }
 
     let agent_id = agent.map(|a| a.id.as_str());
-    let identity = match pick_identity(&state, session_id.as_deref(), agent_id).await {
-        Ok(i) => i,
+    let cred = match pick_credential(&state, session_id.as_deref(), agent_id).await {
+        Ok(c) => c,
         Err(StatusCode::NOT_FOUND) => {
             // Per MCP Streamable HTTP spec: unknown/expired sessions get 404,
             // prompting the client to re-initialize. Never rotate identities
@@ -88,6 +88,9 @@ pub async fn mcp_proxy(
         }
         Err(StatusCode::FORBIDDEN) => {
             return rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent");
+        }
+        Err(StatusCode::BAD_GATEWAY) => {
+            return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable");
         }
         Err(code) => return rpc_error(code, "no upstream identity available"),
     };
@@ -158,13 +161,13 @@ pub async fn mcp_proxy(
                     tracing::info!(
                         "MCP tools/call {}{} [{}]{}",
                         tool_name, repo_suffix,
-                        audit_via(agent, &identity.id),
+                        audit_via(agent, cred.label()),
                         session_suffix(session_id.as_deref())
                     );
                 } else {
                     tracing::info!(
                         "MCP tools/call [{}]{}",
-                        audit_via(agent, &identity.id),
+                        audit_via(agent, cred.label()),
                         session_suffix(session_id.as_deref())
                     );
                 }
@@ -172,7 +175,7 @@ pub async fn mcp_proxy(
                 tracing::info!(
                     "MCP {} [{}]{}",
                     frame.method,
-                    audit_via(agent, &identity.id),
+                    audit_via(agent, cred.label()),
                     session_suffix(session_id.as_deref())
                 );
             }
@@ -199,11 +202,11 @@ pub async fn mcp_proxy(
     };
 
     let Some(upstream_headers) =
-        build_upstream_headers(&headers, &identity.token, &state.config.mcp.toolsets, agent)
+        build_upstream_headers(&headers, cred.token(), &state.config.mcp.toolsets, agent)
     else {
         tracing::error!(
-            "identity {} has a token that is not a valid header value — check secret source",
-            identity.id
+            "credential '{}' is not a valid header value — check secret source",
+            cred.label()
         );
         return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured");
     };
@@ -225,39 +228,37 @@ pub async fn mcp_proxy(
         .get("x-ratelimit-reset")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    state.pool.update_rate(&identity.id, rate_remaining, rate_reset);
+    if let McpCredential::Pat(identity) = &cred {
+        state.pool.update_rate(&identity.id, rate_remaining, rate_reset);
 
-    // Upstream throttled this identity: zero its budget so the pool avoids it
-    // for new sessions until the reported (or a short default) reset.
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        state.pool.update_rate(&identity.id, Some(0), Some(rate_reset.unwrap_or(now + 60)));
-        tracing::warn!("MCP upstream 429 for identity {} — budget zeroed", identity.id);
+        // Upstream throttled this identity: zero its budget so the pool
+        // avoids it for new sessions until the reported (or default) reset.
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            state.pool.update_rate(&identity.id, Some(0), Some(rate_reset.unwrap_or(now + 60)));
+            tracing::warn!("MCP upstream 429 for identity {} — budget zeroed", identity.id);
+        }
+    } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        tracing::warn!("MCP upstream 429 on App installation token");
     }
 
     // Pin new sessions: upstream returns Mcp-Session-Id on initialize.
-    // The pin binds the session to both the pooled identity and the agent
-    // that initialized it.
+    // The pin binds the session to the exact credential and the agent that
+    // initialized it.
     if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         if state.mcp_sessions.get(sid).await.is_none() {
             tracing::info!(
-                "MCP session pinned to identity {}{}{}",
-                identity.id,
+                "MCP session pinned to credential {}{}{}",
+                cred.label(),
                 agent_id.map(|a| format!(" [agent={}]", a)).unwrap_or_default(),
                 session_suffix(Some(sid))
             );
             state
                 .mcp_sessions
-                .insert(
-                    sid.to_string(),
-                    SessionPin {
-                        identity_id: identity.id.clone(),
-                        agent_id: agent_id.map(str::to_string),
-                    },
-                )
+                .insert(sid.to_string(), cred.to_pin(agent_id))
                 .await;
         }
     }
@@ -282,31 +283,75 @@ pub async fn mcp_proxy(
         .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
 }
 
-/// What a pinned MCP session is bound to: the pooled identity whose token
-/// serves it, and (in agent mode) the agent that initialized it. A session
-/// presented by a different agent is rejected — session IDs are not portable
-/// between agents (2b gate: session-to-agent binding).
+/// What a pinned MCP session is bound to: the exact credential serving it,
+/// and (in agent mode) the agent that initialized it. A session presented by
+/// a different agent is rejected; a session whose credential has expired is
+/// terminated (404) — sessions cannot outlive their credential (2b gate).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionPin {
-    pub identity_id: String,
     /// None = session created in Phase 1 network-trust mode (no agents).
     pub agent_id: Option<String>,
+    pub cred: PinnedCred,
 }
 
-/// Resolve the identity for this request per MCP Streamable HTTP session
-/// semantics:
-/// - No session ID (i.e. `initialize`): select the highest-budget identity.
-/// - Known session ID: return the pinned identity — never rotate mid-session.
-///   The session must have been initialized by the SAME agent (or the same
-///   no-agent mode); a mismatch is rejected as 403.
-/// - Unknown/expired session ID (including TTL/capacity eviction of the pin,
-///   or the pinned identity leaving the pool): 404, so the client
-///   re-initializes.
-async fn pick_identity(
+#[derive(Clone, Debug, PartialEq)]
+pub enum PinnedCred {
+    /// Pooled PAT, referenced by identity id (revoked by pool removal).
+    Pat { identity_id: String },
+    /// GitHub App installation token, pinned by value: the session keeps
+    /// using the token it started with (still valid upstream even after the
+    /// provider refreshes) and dies at that token's expiry.
+    App { token: String, expires_at: u64 },
+}
+
+/// The upstream credential resolved for one request.
+pub enum McpCredential {
+    Pat(pool::Identity),
+    App(crate::app_token::AppToken),
+}
+
+impl McpCredential {
+    fn token(&self) -> &str {
+        match self {
+            McpCredential::Pat(i) => &i.token,
+            McpCredential::App(t) => &t.token,
+        }
+    }
+    /// Audit label for the credential.
+    fn label(&self) -> &str {
+        match self {
+            McpCredential::Pat(i) => &i.id,
+            McpCredential::App(_) => "github-app",
+        }
+    }
+    fn to_pin(&self, agent_id: Option<&str>) -> SessionPin {
+        SessionPin {
+            agent_id: agent_id.map(str::to_string),
+            cred: match self {
+                McpCredential::Pat(i) => PinnedCred::Pat { identity_id: i.id.clone() },
+                McpCredential::App(t) => PinnedCred::App {
+                    token: t.token.clone(),
+                    expires_at: t.expires_at,
+                },
+            },
+        }
+    }
+}
+
+/// Resolve the upstream credential for this request per MCP Streamable HTTP
+/// session semantics:
+/// - No session ID (i.e. `initialize`): mint/reuse an App installation token
+///   when the App backend is configured, else select the highest-budget PAT.
+/// - Known session ID: reuse the pinned credential — never rotate
+///   mid-session. The session must belong to the same agent (else 403) and
+///   its credential must still be valid (expired App token / removed PAT
+///   identity → session terminated, 404).
+/// - Unknown/expired session ID: 404, so the client re-initializes.
+async fn pick_credential(
     state: &AppState,
     session_id: Option<&str>,
     agent_id: Option<&str>,
-) -> Result<pool::Identity, StatusCode> {
+) -> Result<McpCredential, StatusCode> {
     if let Some(sid) = session_id {
         if let Some(pin) = state.mcp_sessions.get(sid).await {
             if pin.agent_id.as_deref() != agent_id {
@@ -319,15 +364,51 @@ async fn pick_identity(
                 );
                 return Err(StatusCode::FORBIDDEN);
             }
-            if let Some(ident) = state.pool.get(&pin.identity_id) {
-                return Ok(ident);
+            match pin.cred {
+                PinnedCred::Pat { identity_id } => {
+                    if let Some(ident) = state.pool.get(&identity_id) {
+                        return Ok(McpCredential::Pat(ident));
+                    }
+                    // Identity left the pool — treat as terminated
+                    state.mcp_sessions.invalidate(sid).await;
+                }
+                PinnedCred::App { token, expires_at } => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if expires_at > now {
+                        return Ok(McpCredential::App(crate::app_token::AppToken {
+                            token,
+                            expires_at,
+                        }));
+                    }
+                    // Credential expired: the session cannot outlive it
+                    tracing::info!(
+                        "MCP session terminated: pinned App token expired{}",
+                        session_suffix(Some(sid))
+                    );
+                    state.mcp_sessions.invalidate(sid).await;
+                }
             }
-            // Pinned identity no longer in the pool — treat as terminated
-            state.mcp_sessions.invalidate(sid).await;
         }
         return Err(StatusCode::NOT_FOUND);
     }
-    state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    // New session: App backend takes precedence when configured
+    if let Some(provider) = &state.app_tokens {
+        return match provider.token().await {
+            Ok(t) => Ok(McpCredential::App(t)),
+            Err(e) => {
+                tracing::error!("App token mint failed: {}", e);
+                Err(StatusCode::BAD_GATEWAY)
+            }
+        };
+    }
+    state
+        .pool
+        .select()
+        .map(McpCredential::Pat)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// Phase 2a agent authentication.
@@ -497,17 +578,18 @@ mod tests {
 
     fn pin(identity: &str, agent: Option<&str>) -> SessionPin {
         SessionPin {
-            identity_id: identity.to_string(),
             agent_id: agent.map(str::to_string),
+            cred: PinnedCred::Pat { identity_id: identity.to_string() },
         }
     }
 
-    fn pin(identity: &str, agent: Option<&str>) -> SessionPin {
-        SessionPin {
-            identity_id: identity.to_string(),
-            agent_id: agent.map(str::to_string),
+    fn cred_pat_id(c: &McpCredential) -> &str {
+        match c {
+            McpCredential::Pat(i) => &i.id,
+            McpCredential::App(_) => panic!("expected PAT credential"),
         }
     }
+
 
     fn test_state_full(
         identity_ids: &[&str],
@@ -539,11 +621,13 @@ mod tests {
                     toolsets: toolsets.iter().map(|s| s.to_string()).collect(),
                     session_ttl_secs: 3600,
                     agents,
+                    github_app: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: None,
         })
     }
 
@@ -611,15 +695,15 @@ mod tests {
         let state = test_state(&["alice", "bob"]);
         state.mcp_sessions.insert("sess-1".to_string(), pin("bob", None)).await;
 
-        let ident = pick_identity(&state, Some("sess-1"), None).await.unwrap();
-        assert_eq!(ident.id, "bob");
-        assert_eq!(ident.token, "token-bob");
+        let cred = pick_credential(&state, Some("sess-1"), None).await.unwrap();
+        assert_eq!(cred_pat_id(&cred), "bob");
+        assert_eq!(cred.token(), "token-bob");
     }
 
     #[tokio::test]
     async fn test_unknown_session_returns_404() {
         let state = test_state(&["alice"]);
-        match pick_identity(&state, Some("never-seen"), None).await {
+        match pick_credential(&state, Some("never-seen"), None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("unknown session must not resolve an identity"),
         }
@@ -628,14 +712,14 @@ mod tests {
     #[tokio::test]
     async fn test_no_session_selects_from_pool() {
         let state = test_state(&["alice"]);
-        let ident = pick_identity(&state, None, None).await.unwrap();
-        assert_eq!(ident.id, "alice");
+        let cred = pick_credential(&state, None, None).await.unwrap();
+        assert_eq!(cred_pat_id(&cred), "alice");
     }
 
     #[tokio::test]
     async fn test_no_identities_returns_503() {
         let state = test_state(&[]);
-        match pick_identity(&state, None, None).await {
+        match pick_credential(&state, None, None).await {
             Err(code) => assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE),
             Ok(_) => panic!("expected SERVICE_UNAVAILABLE with empty pool"),
         }
@@ -647,7 +731,7 @@ mod tests {
         // treated as terminated (404), pin removed — never identity rotation.
         let state = test_state(&["alice"]);
         state.mcp_sessions.insert("sess-x".to_string(), pin("gone", None)).await;
-        match pick_identity(&state, Some("sess-x"), None).await {
+        match pick_credential(&state, Some("sess-x"), None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("stale pin must not resolve an identity"),
         }
@@ -1347,5 +1431,154 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    // ---- 2b-3: GitHub App credential backend ----
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Mock GitHub API that mints installation tokens.
+    async fn spawn_mock_github() -> String {
+        let app = axum::Router::new().route(
+            "/app/installations/42/access_tokens",
+            axum::routing::post(|| async {
+                let exp = time::OffsetDateTime::from_unix_timestamp((now() + 3600) as i64)
+                    .unwrap()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap();
+                axum::Json(serde_json::json!({"token": "ghs_mock_token", "expires_at": exp}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    async fn test_state_app_mode(upstream: &str) -> Arc<AppState> {
+        let gh = spawn_mock_github().await;
+        let provider = crate::app_token::AppTokenProvider::new(
+            "12345".into(),
+            crate::app_token::tests::TEST_RSA_PEM,
+            Some(42),
+            None,
+            gh,
+        )
+        .unwrap();
+        // No PAT identities: App backend is the only credential source
+        let cache_config = config::CacheConfig::default();
+        Arc::new(AppState {
+            pool: pool::PatPool::new(&[]),
+            cache: cache::Cache::new(&cache_config),
+            config: config::Config {
+                port: 8080,
+                identities: vec![],
+                allowed_owners: vec!["openabdev".to_string()],
+                cache: cache_config,
+                mcp: config::McpConfig {
+                    enabled: true,
+                    upstream: upstream.to_string(),
+                    toolsets: vec![],
+                    session_ttl_secs: 3600,
+                    agents: vec![],
+                    github_app: None, // provider injected directly below
+                },
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: Some(provider),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_app_mode_mints_and_pins_app_credential() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_app_mode(&url).await;
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Upstream saw the App installation token
+        assert_eq!(
+            captured.lock().unwrap()[0].auth.as_deref(),
+            Some("Bearer ghs_mock_token")
+        );
+
+        // Session pinned to the App credential by value
+        let pin = state.mcp_sessions.get("mock-sess-1").await.unwrap();
+        match pin.cred {
+            PinnedCred::App { token, expires_at } => {
+                assert_eq!(token, "ghs_mock_token");
+                assert!(expires_at > now() + 3000);
+            }
+            other => panic!("expected App pin, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_app_mode_session_reuses_pinned_token() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_app_mode(&url).await;
+
+        // initialize → pin
+        mcp_app(state.clone())
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .await
+            .unwrap();
+        // follow-up on the same session
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("mcp-session-id", "mock-sess-1")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].auth.as_deref(), Some("Bearer ghs_mock_token"));
+    }
+
+    #[tokio::test]
+    async fn test_session_cannot_outlive_app_credential() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_app_mode(&url).await;
+
+        // Simulate a session whose pinned App token has expired
+        state
+            .mcp_sessions
+            .insert(
+                "old-sess".to_string(),
+                SessionPin {
+                    agent_id: None,
+                    cred: PinnedCred::App {
+                        token: "ghs_expired".into(),
+                        expires_at: now() - 10,
+                    },
+                },
+            )
+            .await;
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("mcp-session-id", "old-sess")],
+            ))
+            .await
+            .unwrap();
+        // Terminated per MCP spec: 404 → client re-initializes
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Pin removed; upstream never called
+        assert!(state.mcp_sessions.get("old-sess").await.is_none());
+        assert!(captured.lock().unwrap().is_empty());
     }
 }

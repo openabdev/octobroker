@@ -49,6 +49,18 @@ enabled = false
 # Idle TTL for MCP session → identity pinning.
 # session_ttl_secs = 3600
 
+# GitHub App credential backend (Phase 2b) — RECOMMENDED for production MCP.
+# When configured, the MCP path injects short-lived installation tokens
+# (minted lazily, auto-refreshed ~5 min before expiry) instead of pooled
+# PATs. Sessions cannot outlive the token they started with: at token
+# expiry the session gets 404 and the client re-initializes transparently.
+# The PAT pool remains for REST/GraphQL and as the MCP fallback.
+# [mcp.github_app]
+# app_id = "123456"
+# private_key = "aws:secretsmanager:ghpool/app:private_key"  # env:/k8s: also work
+# owner = "openabdev"          # installation discovered from org/user…
+# # installation_id = 87654321 # …or set explicitly
+
 # Per-agent authentication + default-deny tool allowlists (Phase 2a).
 # When any [[mcp.agents]] entry exists, EVERY /mcp request must present a
 # valid X-Ghpool-Key header. tools/call for a tool not on the agent's
