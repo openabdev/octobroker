@@ -73,7 +73,8 @@ pub async fn mcp_proxy(
         return rpc_error(StatusCode::BAD_REQUEST, "Mcp-Session-Id header required");
     }
 
-    let identity = match pick_identity(&state, session_id.as_deref()).await {
+    let agent_id = agent.map(|a| a.id.as_str());
+    let identity = match pick_identity(&state, session_id.as_deref(), agent_id).await {
         Ok(i) => i,
         Err(StatusCode::NOT_FOUND) => {
             // Per MCP Streamable HTTP spec: unknown/expired sessions get 404,
@@ -84,6 +85,9 @@ pub async fn mcp_proxy(
                 session_suffix(session_id.as_deref())
             );
             return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
+        }
+        Err(StatusCode::FORBIDDEN) => {
+            return rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent");
         }
         Err(code) => return rpc_error(code, "no upstream identity available"),
     };
@@ -181,15 +185,27 @@ pub async fn mcp_proxy(
         tracing::warn!("MCP upstream 429 for identity {} — budget zeroed", identity.id);
     }
 
-    // Pin new sessions: upstream returns Mcp-Session-Id on initialize
+    // Pin new sessions: upstream returns Mcp-Session-Id on initialize.
+    // The pin binds the session to both the pooled identity and the agent
+    // that initialized it.
     if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         if state.mcp_sessions.get(sid).await.is_none() {
             tracing::info!(
-                "MCP session pinned to identity {}{}",
+                "MCP session pinned to identity {}{}{}",
                 identity.id,
+                agent_id.map(|a| format!(" [agent={}]", a)).unwrap_or_default(),
                 session_suffix(Some(sid))
             );
-            state.mcp_sessions.insert(sid.to_string(), identity.id.clone()).await;
+            state
+                .mcp_sessions
+                .insert(
+                    sid.to_string(),
+                    SessionPin {
+                        identity_id: identity.id.clone(),
+                        agent_id: agent_id.map(str::to_string),
+                    },
+                )
+                .await;
         }
     }
 
@@ -213,20 +229,44 @@ pub async fn mcp_proxy(
         .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
 }
 
+/// What a pinned MCP session is bound to: the pooled identity whose token
+/// serves it, and (in agent mode) the agent that initialized it. A session
+/// presented by a different agent is rejected — session IDs are not portable
+/// between agents (2b gate: session-to-agent binding).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionPin {
+    pub identity_id: String,
+    /// None = session created in Phase 1 network-trust mode (no agents).
+    pub agent_id: Option<String>,
+}
+
 /// Resolve the identity for this request per MCP Streamable HTTP session
 /// semantics:
 /// - No session ID (i.e. `initialize`): select the highest-budget identity.
 /// - Known session ID: return the pinned identity — never rotate mid-session.
+///   The session must have been initialized by the SAME agent (or the same
+///   no-agent mode); a mismatch is rejected as 403.
 /// - Unknown/expired session ID (including TTL/capacity eviction of the pin,
 ///   or the pinned identity leaving the pool): 404, so the client
 ///   re-initializes.
 async fn pick_identity(
     state: &AppState,
     session_id: Option<&str>,
+    agent_id: Option<&str>,
 ) -> Result<pool::Identity, StatusCode> {
     if let Some(sid) = session_id {
-        if let Some(id) = state.mcp_sessions.get(sid).await {
-            if let Some(ident) = state.pool.get(&id) {
+        if let Some(pin) = state.mcp_sessions.get(sid).await {
+            if pin.agent_id.as_deref() != agent_id {
+                // Session binding violation: a different agent (or mode) is
+                // presenting this session ID. Do not disclose whether the
+                // session exists beyond the rejection itself.
+                tracing::warn!(
+                    "MCP session binding violation: session initialized by {:?}, presented by {:?}{}",
+                    pin.agent_id, agent_id, session_suffix(Some(sid))
+                );
+                return Err(StatusCode::FORBIDDEN);
+            }
+            if let Some(ident) = state.pool.get(&pin.identity_id) {
                 return Ok(ident);
             }
             // Pinned identity no longer in the pool — treat as terminated
@@ -254,7 +294,7 @@ fn authenticate<'a>(
         return Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "X-Ghpool-Key header required")));
     };
     for agent in agents {
-        if keys_match(&agent.key, presented) {
+        if agent.keys.iter().any(|k| keys_match(k, presented)) {
             return Ok(Some(agent));
         }
     }
@@ -384,8 +424,16 @@ mod tests {
     fn agent(id: &str, key: &str, tools: &[&str]) -> config::McpAgentConfig {
         config::McpAgentConfig {
             id: id.to_string(),
-            key: key.to_string(),
+            key: None,
+            keys: vec![key.to_string()],
             tools: tools.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn pin(identity: &str, agent: Option<&str>) -> SessionPin {
+        SessionPin {
+            identity_id: identity.to_string(),
+            agent_id: agent.map(str::to_string),
         }
     }
 
@@ -487,9 +535,9 @@ mod tests {
     #[tokio::test]
     async fn test_session_pinning_returns_pinned_identity() {
         let state = test_state(&["alice", "bob"]);
-        state.mcp_sessions.insert("sess-1".to_string(), "bob".to_string()).await;
+        state.mcp_sessions.insert("sess-1".to_string(), pin("bob", None)).await;
 
-        let ident = pick_identity(&state, Some("sess-1")).await.unwrap();
+        let ident = pick_identity(&state, Some("sess-1"), None).await.unwrap();
         assert_eq!(ident.id, "bob");
         assert_eq!(ident.token, "token-bob");
     }
@@ -497,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_session_returns_404() {
         let state = test_state(&["alice"]);
-        match pick_identity(&state, Some("never-seen")).await {
+        match pick_identity(&state, Some("never-seen"), None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("unknown session must not resolve an identity"),
         }
@@ -506,14 +554,14 @@ mod tests {
     #[tokio::test]
     async fn test_no_session_selects_from_pool() {
         let state = test_state(&["alice"]);
-        let ident = pick_identity(&state, None).await.unwrap();
+        let ident = pick_identity(&state, None, None).await.unwrap();
         assert_eq!(ident.id, "alice");
     }
 
     #[tokio::test]
     async fn test_no_identities_returns_503() {
         let state = test_state(&[]);
-        match pick_identity(&state, None).await {
+        match pick_identity(&state, None, None).await {
             Err(code) => assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE),
             Ok(_) => panic!("expected SERVICE_UNAVAILABLE with empty pool"),
         }
@@ -524,8 +572,8 @@ mod tests {
         // Session pinned to an identity that no longer exists in the pool:
         // treated as terminated (404), pin removed — never identity rotation.
         let state = test_state(&["alice"]);
-        state.mcp_sessions.insert("sess-x".to_string(), "gone".to_string()).await;
-        match pick_identity(&state, Some("sess-x")).await {
+        state.mcp_sessions.insert("sess-x".to_string(), pin("gone", None)).await;
+        match pick_identity(&state, Some("sess-x"), None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("stale pin must not resolve an identity"),
         }
@@ -678,10 +726,11 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], MOCK_SSE_BODY.as_bytes());
 
-        // Session pinned to the identity that served initialize
+        // Session pinned to the identity that served initialize (Phase 1
+        // mode: no agent binding)
         assert_eq!(
-            state.mcp_sessions.get("mock-sess-1").await.as_deref(),
-            Some("alice")
+            state.mcp_sessions.get("mock-sess-1").await,
+            Some(pin("alice", None))
         );
     }
 
@@ -722,7 +771,7 @@ mod tests {
         let state = test_state_with(&["alice"], &url, &[]);
         state
             .mcp_sessions
-            .insert("dead-sess".to_string(), "alice".to_string())
+            .insert("dead-sess".to_string(), pin("alice", None))
             .await;
 
         let req = Request::builder()
@@ -976,5 +1025,105 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    // ---- 2b-1: session-to-agent binding + dual-key rotation ----
+
+    #[tokio::test]
+    async fn test_session_binding_rejects_different_agent() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![
+                agent("bot-a", "key-a", &["issue_read"]),
+                agent("bot-b", "key-b", &["issue_read"]),
+            ],
+        );
+        // bot-a initializes and owns the session
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.mcp_sessions.get("mock-sess-1").await,
+            Some(pin("alice", Some("bot-a")))
+        );
+
+        // bot-b presents bot-a's session ID with a VALID key of its own → 403
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-ghpool-key", "key-b"), ("mcp-session-id", "mock-sess-1")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Upstream saw only the initialize
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        // The rightful owner still works
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-ghpool-key", "key-a"), ("mcp-session-id", "mock-sess-1")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_session_binding_rejects_phase1_session_in_agent_mode() {
+        // A pin without an agent binding must not be usable by an
+        // authenticated agent (and vice versa) — mode changes invalidate.
+        let (url, _captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        state.mcp_sessions.insert("old-sess".to_string(), pin("alice", None)).await;
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-ghpool-key", "key-a"), ("mcp-session-id", "old-sess")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_dual_keys_both_valid_for_rotation() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let mut a = agent("bot-a", "old-key", &["issue_read"]);
+        a.keys.push("new-key".to_string());
+        let state = test_state_full(&["alice"], &url, &[], vec![a]);
+
+        for key in ["old-key", "new-key"] {
+            let resp = mcp_app(state.clone())
+                .oneshot(post_frame(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    &[("x-ghpool-key", key)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "key {} must be valid", key);
+        }
+        assert_eq!(captured.lock().unwrap().len(), 2);
+
+        // Both keys resolve to the SAME agent (same policy)
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"not_allowed","arguments":{}}}"#,
+                &[("x-ghpool-key", "new-key")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

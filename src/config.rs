@@ -81,14 +81,19 @@ pub struct McpConfig {
     pub agents: Vec<McpAgentConfig>,
 }
 
-/// One authenticated MCP agent: key → identity → tool allowlist.
+/// One authenticated MCP agent: key(s) → identity → tool allowlist.
 #[derive(Clone, Deserialize)]
 pub struct McpAgentConfig {
     pub id: String,
-    /// Shared key presented via X-Ghpool-Key. Supports the same secret
-    /// reference formats as identity tokens (env:/aws:secretsmanager:/k8s:);
-    /// resolved at config load.
-    pub key: String,
+    /// Shared key presented via X-Ghpool-Key (single-key form). Supports the
+    /// same secret reference formats as identity tokens; resolved at load.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Multiple simultaneously valid keys, for zero-downtime rotation:
+    /// add the new key, roll agents over, remove the old key. Merged with
+    /// `key` at config load (both forms may be combined).
+    #[serde(default)]
+    pub keys: Vec<String>,
     /// Default-deny tool allowlist (exact upstream tool names, e.g.
     /// "issue_read"). tools/call for anything not listed is rejected at the
     /// proxy; the same list is injected upstream as X-MCP-Tools.
@@ -215,7 +220,18 @@ impl Config {
         }
         let mut mcp = raw.mcp;
         for agent in &mut mcp.agents {
-            agent.key = resolve_secret(&agent.key).await;
+            // Normalize: resolve secret refs and collapse `key` into `keys`.
+            let mut resolved = Vec::new();
+            if let Some(k) = agent.key.take() {
+                resolved.push(resolve_secret(&k).await);
+            }
+            for k in &agent.keys {
+                resolved.push(resolve_secret(k).await);
+            }
+            if resolved.is_empty() {
+                panic!("mcp agent '{}' has no key/keys configured", agent.id);
+            }
+            agent.keys = resolved;
         }
         Config {
             port: raw.port,
