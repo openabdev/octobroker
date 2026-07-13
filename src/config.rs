@@ -83,6 +83,27 @@ pub struct McpConfig {
     /// path injects short-lived installation tokens instead of pooled PATs.
     #[serde(default)]
     pub github_app: Option<GithubAppConfig>,
+    /// Durable audit trail for write-classified tools/call (Phase 2b).
+    /// Required before writes can be enabled (2b-5): a write call whose
+    /// pre-flight audit record cannot be persisted is rejected (fail-closed).
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+}
+
+/// Durable audit configuration.
+#[derive(Clone, Deserialize)]
+pub struct AuditConfig {
+    /// JSONL file path (append + fsync per record).
+    pub path: String,
+    /// Max upstream response bytes buffered to extract the tool outcome for
+    /// write calls; larger responses are forwarded but recorded with
+    /// tool_error = null (undeterminable).
+    #[serde(default = "default_audit_max_result_bytes")]
+    pub max_result_bytes: usize,
+}
+
+fn default_audit_max_result_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 /// GitHub App credentials for the MCP path.
@@ -137,6 +158,7 @@ impl Default for McpConfig {
             session_ttl_secs: default_mcp_session_ttl(),
             agents: Vec::new(),
             github_app: None,
+            audit: None,
         }
     }
 }

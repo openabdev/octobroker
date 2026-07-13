@@ -958,6 +958,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-secretsmanager",
  "axum",
+ "futures-util",
  "hyper 1.10.0",
  "jsonwebtoken",
  "moka",

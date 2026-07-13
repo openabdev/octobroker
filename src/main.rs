@@ -1,4 +1,5 @@
 mod app_token;
+mod audit;
 mod cache;
 mod config;
 mod mcp;
@@ -28,6 +29,9 @@ struct AppState {
     /// GitHub App installation token provider for the MCP path (2b).
     /// None = PAT pool backend.
     app_tokens: Option<app_token::AppTokenProvider>,
+    /// Durable audit sink for write-classified MCP calls (2b). None = audit
+    /// not configured (writes cannot be enabled without it).
+    audit: Option<audit::AuditSink>,
 }
 
 #[tokio::main]
@@ -57,6 +61,12 @@ async fn main() {
         tracing::info!("MCP credential backend: GitHub App installation tokens");
     }
 
+    let audit = config.mcp.audit.as_ref().map(|a| {
+        let sink = audit::AuditSink::open(&a.path).expect("invalid [mcp.audit] config");
+        tracing::info!("MCP durable audit enabled → {}", a.path);
+        sink
+    });
+
     let state = Arc::new(AppState {
         pool,
         cache,
@@ -68,6 +78,7 @@ async fn main() {
             .time_to_idle(std::time::Duration::from_secs(config.mcp.session_ttl_secs))
             .build(),
         app_tokens,
+        audit,
     });
 
     let mut app = Router::new()
@@ -412,6 +423,7 @@ mod tests {
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
             app_tokens: None,
+            audit: None,
         })
     }
 

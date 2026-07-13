@@ -17,6 +17,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 # RS256 JWT signing for GitHub App authentication (App backend, #17 2b)
 jsonwebtoken = "9.3"
+futures-util = { version = "0.3", default-features = false }
 moka = { version = "0.12", features = ["future"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }

@@ -49,6 +49,16 @@ enabled = false
 # Idle TTL for MCP session → identity pinning.
 # session_ttl_secs = 3600
 
+# Durable audit trail for write-classified MCP calls (Phase 2b).
+# REQUIRED before writes can be enabled. Two JSONL records per write call
+# (request pre-flight + result), fsync'd. FAIL-CLOSED: if the pre-flight
+# record cannot be persisted, the write call is rejected (503). The result
+# record captures the MCP tool outcome (result.isError) — HTTP 200 alone is
+# not a success signal. Argument VALUES are never recorded (key names only).
+# [mcp.audit]
+# path = "/var/lib/ghpool/mcp-audit.jsonl"
+# max_result_bytes = 4194304  # response buffer cap for outcome extraction
+
 # GitHub App credential backend (Phase 2b) — RECOMMENDED for production MCP.
 # When configured, the MCP path injects short-lived installation tokens
 # (minted lazily, auto-refreshed ~5 min before expiry) instead of pooled

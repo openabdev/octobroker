@@ -20,6 +20,8 @@
 //! own permissions and the read-only upstream. Per-agent policy is tracked in
 //! https://github.com/openabdev/ghpool/issues/17.
 
+use futures_util::StreamExt as _;
+
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -95,90 +97,126 @@ pub async fn mcp_proxy(
         Err(code) => return rpc_error(code, "no upstream identity available"),
     };
 
-    // Audit log + policy enforcement (single frame parse)
-    if method == Method::POST {
-        if let Some(frame) = parse_frame(&body) {
-            if frame.method == "tools/call" {
-                if let Some(tool_name) = frame.tool.as_deref() {
-                    let repo = crate::policy::resolve_repo(frame.arguments.as_ref());
-                    if let Some(agent) = agent {
-                        // 1. Default-deny tool allowlist (authoritative)
-                        if !agent.tools.iter().any(|t| t == tool_name) {
-                            tracing::warn!(
-                                "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
-                                tool_name, agent.id, session_suffix(session_id.as_deref())
-                            );
-                            return rpc_error(
-                                StatusCode::FORBIDDEN,
-                                "tool not permitted by agent policy",
-                            );
-                        }
-                        // 2. Write classification: ALL write-classified tools
-                        //    are blocked until the write path ships (2b-5).
-                        //    Unknown tools classify as writes (conservative).
-                        if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write {
-                            tracing::warn!(
-                                "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
-                                tool_name, agent.id, session_suffix(session_id.as_deref())
-                            );
-                            return rpc_error(
-                                StatusCode::FORBIDDEN,
-                                "write tools are not enabled",
-                            );
-                        }
-                        // 3. Repository allowlist (deny-if-unresolvable)
-                        if !agent.repos.is_empty() {
-                            match &repo {
-                                None => {
+    // Audit log + policy enforcement (single frame parse, kept for the
+    // write-audit path below)
+    let frame = if method == Method::POST { parse_frame(&body) } else { None };
+    let mut resolved_repo: Option<(String, String)> = None;
+    if let Some(frame) = &frame {
+        if frame.method == "tools/call" {
+            if let Some(tool_name) = frame.tool.as_deref() {
+                resolved_repo = crate::policy::resolve_repo(frame.arguments.as_ref());
+                if let Some(agent) = agent {
+                    // 1. Default-deny tool allowlist (authoritative)
+                    if !agent.tools.iter().any(|t| t == tool_name) {
+                        tracing::warn!(
+                            "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
+                            tool_name, agent.id, session_suffix(session_id.as_deref())
+                        );
+                        return rpc_error(
+                            StatusCode::FORBIDDEN,
+                            "tool not permitted by agent policy",
+                        );
+                    }
+                    // 2. Write classification: ALL write-classified tools
+                    //    are blocked until the write path ships (2b-5).
+                    //    Unknown tools classify as writes (conservative).
+                    if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write {
+                        tracing::warn!(
+                            "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
+                            tool_name, agent.id, session_suffix(session_id.as_deref())
+                        );
+                        return rpc_error(
+                            StatusCode::FORBIDDEN,
+                            "write tools are not enabled",
+                        );
+                    }
+                    // 3. Repository allowlist (deny-if-unresolvable)
+                    if !agent.repos.is_empty() {
+                        match &resolved_repo {
+                            None => {
+                                tracing::warn!(
+                                    "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
+                                    tool_name, agent.id, session_suffix(session_id.as_deref())
+                                );
+                                return rpc_error(
+                                    StatusCode::FORBIDDEN,
+                                    "call has no resolvable repository target",
+                                );
+                            }
+                            Some((owner, repo_name)) => {
+                                if !crate::policy::repo_allowed(&agent.repos, owner, repo_name) {
                                     tracing::warn!(
-                                        "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
-                                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                                        "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
+                                        tool_name, owner, repo_name, agent.id,
+                                        session_suffix(session_id.as_deref())
                                     );
                                     return rpc_error(
                                         StatusCode::FORBIDDEN,
-                                        "call has no resolvable repository target",
+                                        "repository not permitted by agent policy",
                                     );
-                                }
-                                Some((owner, repo_name)) => {
-                                    if !crate::policy::repo_allowed(&agent.repos, owner, repo_name) {
-                                        tracing::warn!(
-                                            "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
-                                            tool_name, owner, repo_name, agent.id,
-                                            session_suffix(session_id.as_deref())
-                                        );
-                                        return rpc_error(
-                                            StatusCode::FORBIDDEN,
-                                            "repository not permitted by agent policy",
-                                        );
-                                    }
                                 }
                             }
                         }
                     }
-                    let repo_suffix = repo
-                        .map(|(o, r)| format!(" repo={}/{}", o, r))
-                        .unwrap_or_default();
-                    tracing::info!(
-                        "MCP tools/call {}{} [{}]{}",
-                        tool_name, repo_suffix,
-                        audit_via(agent, cred.label()),
-                        session_suffix(session_id.as_deref())
-                    );
-                } else {
-                    tracing::info!(
-                        "MCP tools/call [{}]{}",
-                        audit_via(agent, cred.label()),
-                        session_suffix(session_id.as_deref())
-                    );
                 }
+                let repo_suffix = resolved_repo
+                    .as_ref()
+                    .map(|(o, r)| format!(" repo={}/{}", o, r))
+                    .unwrap_or_default();
+                tracing::info!(
+                    "MCP tools/call {}{} [{}]{}",
+                    tool_name, repo_suffix,
+                    audit_via(agent, cred.label()),
+                    session_suffix(session_id.as_deref())
+                );
             } else {
                 tracing::info!(
-                    "MCP {} [{}]{}",
-                    frame.method,
+                    "MCP tools/call [{}]{}",
                     audit_via(agent, cred.label()),
                     session_suffix(session_id.as_deref())
                 );
             }
+        } else {
+            tracing::info!(
+                "MCP {} [{}]{}",
+                frame.method,
+                audit_via(agent, cred.label()),
+                session_suffix(session_id.as_deref())
+            );
+        }
+    }
+
+    // Durable audit (2b): write-classified calls that will be forwarded get
+    // a fail-closed pre-flight record and (below) a buffered-response result
+    // record. Reads keep best-effort tracing only.
+    let write_call = frame.as_ref().and_then(|f| {
+        f.tool
+            .as_deref()
+            .filter(|t| {
+                f.method == "tools/call"
+                    && crate::policy::classify_tool(t) == crate::policy::ToolKind::Write
+            })
+            .map(str::to_string)
+    });
+    if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
+        let call = crate::audit::CallInfo {
+            rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+            session: session_id.as_deref(),
+            agent: agent_id,
+            credential: cred.label(),
+            tool: tool_name,
+            repo: resolved_repo.as_ref(),
+        };
+        let arg_keys =
+            crate::audit::redacted_arg_keys(frame.as_ref().and_then(|f| f.arguments.as_ref()));
+        if let Err(e) = sink.record_request(&call, &arg_keys) {
+            // FAIL-CLOSED: a write whose audit record cannot be persisted
+            // must not happen.
+            tracing::error!("audit unavailable — rejecting write call (fail-closed): {}", e);
+            return rpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit backend unavailable — write rejected",
+            );
         }
     }
 
@@ -278,9 +316,107 @@ pub async fn mcp_proxy(
         }
     }
 
+    // Audited write call: buffer the response (bounded) to extract the MCP
+    // tool outcome — a failed GitHub operation arrives as result.isError
+    // inside an HTTP 200/SSE body, so HTTP status alone is not a success
+    // signal. Reads keep the zero-copy streaming path.
+    if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let cap = state
+            .config
+            .mcp
+            .audit
+            .as_ref()
+            .map(|a| a.max_result_bytes)
+            .unwrap_or(4 * 1024 * 1024);
+
+        let call = crate::audit::CallInfo {
+            rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+            session: session_id.as_deref(),
+            agent: agent_id,
+            credential: cred.label(),
+            tool: tool_name,
+            repo: resolved_repo.as_ref(),
+        };
+
+        match buffer_body(resp, cap).await {
+            Ok(BufferedBody::Complete(bytes)) => {
+                let tool_error =
+                    crate::audit::parse_tool_outcome(content_type.as_deref(), &bytes);
+                let outcome = crate::audit::CallOutcome {
+                    http_status: status.as_u16(),
+                    tool_error,
+                };
+                if let Err(e) = sink.record_result(&call, &outcome) {
+                    // The call already happened — cannot unwind. Loud error.
+                    tracing::error!("audit result record failed (call already executed): {}", e);
+                }
+                return builder
+                    .body(Body::from(bytes))
+                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+            }
+            Ok(BufferedBody::Overflow(head, rest)) => {
+                // Oversize: outcome undeterminable; forward head + remainder
+                let outcome = crate::audit::CallOutcome {
+                    http_status: status.as_u16(),
+                    tool_error: None,
+                };
+                if let Err(e) = sink.record_result(&call, &outcome) {
+                    tracing::error!("audit result record failed (call already executed): {}", e);
+                }
+                let head_stream = futures_util::stream::once(async move {
+                    Ok::<_, reqwest::Error>(Bytes::from(head))
+                });
+                return builder
+                    .body(Body::from_stream(head_stream.chain(rest)))
+                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+            }
+            Err(e) => {
+                tracing::error!("upstream body read failed mid-response: {}", e);
+                let outcome = crate::audit::CallOutcome {
+                    http_status: StatusCode::BAD_GATEWAY.as_u16(),
+                    tool_error: None,
+                };
+                if let Err(e) = sink.record_result(&call, &outcome) {
+                    tracing::error!("audit result record failed: {}", e);
+                }
+                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+            }
+        }
+    }
+
     builder
         .body(Body::from_stream(resp.bytes_stream()))
         .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
+}
+
+/// Result of buffering an upstream response up to a byte cap.
+enum BufferedBody {
+    /// Entire body fit within the cap.
+    Complete(Vec<u8>),
+    /// Cap exceeded: buffered head + the remaining live stream.
+    Overflow(
+        Vec<u8>,
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    ),
+}
+
+async fn buffer_body(resp: reqwest::Response, cap: usize) -> Result<BufferedBody, String> {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream().boxed();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let b = chunk.map_err(|e| e.to_string())?;
+        buf.extend_from_slice(&b);
+        if buf.len() > cap {
+            return Ok(BufferedBody::Overflow(buf, stream));
+        }
+    }
+    Ok(BufferedBody::Complete(buf))
 }
 
 /// What a pinned MCP session is bound to: the exact credential serving it,
@@ -520,6 +656,8 @@ fn build_upstream_headers(
 /// A best-effort parse of a JSON-RPC request frame.
 struct Frame {
     method: String,
+    /// JSON-RPC request id (for audit correlation).
+    rpc_id: Option<serde_json::Value>,
     /// Tool name, for `tools/call` frames.
     tool: Option<String>,
     /// Tool arguments, for `tools/call` frames.
@@ -529,6 +667,7 @@ struct Frame {
 fn parse_frame(body: &[u8]) -> Option<Frame> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let method = v.get("method")?.as_str()?.to_string();
+    let rpc_id = v.get("id").cloned();
     let (tool, arguments) = if method == "tools/call" {
         let params = v.get("params");
         (
@@ -541,7 +680,7 @@ fn parse_frame(body: &[u8]) -> Option<Frame> {
     } else {
         (None, None)
     };
-    Some(Frame { method, tool, arguments })
+    Some(Frame { method, rpc_id, tool, arguments })
 }
 
 fn session_suffix(session_id: Option<&str>) -> String {
@@ -622,12 +761,14 @@ mod tests {
                     session_ttl_secs: 3600,
                     agents,
                     github_app: None,
+                    audit: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: None,
+            audit: None,
         })
     }
 
@@ -780,6 +921,16 @@ mod tests {
             return Response::builder()
                 .status(500)
                 .body(Body::from("upstream error"))
+                .unwrap();
+        }
+        if body_str.contains("make_it_fail") {
+            // Tool-level failure inside HTTP 200 (the isError case)
+            return Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}"#,
+                ))
                 .unwrap();
         }
         if body_str.contains("\"initialize\"") {
@@ -1487,12 +1638,14 @@ mod tests {
                     session_ttl_secs: 3600,
                     agents: vec![],
                     github_app: None, // provider injected directly below
+                    audit: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: Some(provider),
+            audit: None,
         })
     }
 
@@ -1580,5 +1733,175 @@ mod tests {
         // Pin removed; upstream never called
         assert!(state.mcp_sessions.get("old-sess").await.is_none());
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    // ---- 2b-4: durable fail-closed audit for write calls ----
+
+    fn audit_tmp(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("ghpool-mcp-audit-{}-{}.jsonl", name, std::process::id()))
+            .to_str().unwrap().to_string()
+    }
+
+    /// Phase-1-mode state (writes pass through) with a real audit sink.
+    fn test_state_audited(upstream: &str, sink: crate::audit::AuditSink, cap: usize) -> Arc<AppState> {
+        let cache_config = config::CacheConfig::default();
+        let identities = vec![config::IdentityConfig { id: "alice".into(), token: "token-alice".into() }];
+        Arc::new(AppState {
+            pool: pool::PatPool::new(&identities),
+            cache: cache::Cache::new(&cache_config),
+            config: config::Config {
+                port: 8080,
+                identities,
+                allowed_owners: vec!["openabdev".to_string()],
+                cache: cache_config,
+                mcp: config::McpConfig {
+                    enabled: true,
+                    upstream: upstream.to_string(),
+                    toolsets: vec![],
+                    session_ttl_secs: 3600,
+                    agents: vec![],
+                    github_app: None,
+                    audit: Some(config::AuditConfig { path: "unused".into(), max_result_bytes: cap }),
+                },
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: None,
+            audit: Some(sink),
+        })
+    }
+
+    fn read_audit(path: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_write_call_records_request_and_result() {
+        let (url, _captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("ok");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_audited(&url, sink, 1024 * 1024);
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"secret title"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // body still delivered intact
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty());
+
+        let records = read_audit(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["phase"], "request");
+        assert_eq!(records[0]["tool"], "create_issue");
+        assert_eq!(records[0]["repo"], "openabdev/ghpool");
+        assert_eq!(records[0]["rpc_id"], 7);
+        // argument VALUES never recorded
+        assert!(!records[0].to_string().contains("secret title"));
+        assert_eq!(records[1]["phase"], "result");
+        assert_eq!(records[1]["http_status"], 200);
+        assert_eq!(records[1]["tool_error"], false);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_write_call_records_tool_error_inside_http_200() {
+        let (url, _captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("iserror");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_audited(&url, sink, 1024 * 1024);
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"make_it_fail","arguments":{"owner":"o","repo":"r"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK); // transport says OK…
+
+        let records = read_audit(&path);
+        assert_eq!(records[1]["http_status"], 200);
+        assert_eq!(records[1]["tool_error"], true); // …audit says the operation failed
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_audit_fail_closed_rejects_write_before_upstream() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let sink = crate::audit::AuditSink::failing_for_tests();
+        let state = test_state_audited(&url, sink, 1024 * 1024);
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"o","repo":"r"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("audit"));
+        // FAIL-CLOSED: upstream never saw the call
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_calls_bypass_audit_sink() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("reads");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_audited(&url, sink, 1024 * 1024);
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"o","repo":"r"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        // reads: streaming path, no durable records
+        assert!(read_audit(&path).is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_oversize_write_response_delivered_with_null_outcome() {
+        let (url, _captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("overflow");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        // cap of 4 bytes: every response overflows
+        let state = test_state_audited(&url, sink, 4);
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"o","repo":"r"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // full body still delivered despite the tiny buffer cap
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("result").is_some());
+
+        let records = read_audit(&path);
+        assert_eq!(records[1]["phase"], "result");
+        assert_eq!(records[1]["tool_error"], serde_json::Value::Null);
+        std::fs::remove_file(&path).ok();
     }
 }
