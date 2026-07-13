@@ -1,8 +1,13 @@
 name: E2E
 
 # Runs the MCP proxy e2e suite against GitHub's hosted MCP server.
-# Deliberately NOT triggered on pull_request: the required user token
-# (E2E_GHPOOL_PAT secret) must never be exposed to fork PR workflows.
+# Deliberately NOT triggered on pull_request: the GitHub App credentials
+# (APP_ID / APP_PRIVATE_KEY secrets) must never be exposed to fork PR
+# workflows.
+#
+# Credential: a short-lived GitHub App installation token minted per run
+# (verified working against api.githubcopilot.com in the Phase 0 spike,
+# issue #22). No long-lived PAT required.
 on:
   workflow_dispatch:
   push:
@@ -27,25 +32,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Require E2E secret (this job only runs on trusted triggers)
-        env:
-          E2E_GHPOOL_PAT: ${{ secrets.E2E_GHPOOL_PAT }}
-        run: |
-          if [ -z "${E2E_GHPOOL_PAT}" ]; then
-            echo "::error::E2E_GHPOOL_PAT secret is not configured. This job runs"
-            echo "::error::only on main/dispatch (no forks), so the secret must be set."
-            echo "::error::Add a user PAT: gh secret set E2E_GHPOOL_PAT"
-            exit 1
-          fi
+      - name: Mint GitHub App installation token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: openabdev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo build
         run: cargo build
       - name: e2e — MCP reverse proxy against hosted endpoint
         env:
-          # Must be a user token (PAT); the Actions installation token is not
-          # accepted by api.githubcopilot.com.
-          GITHUB_TOKEN: ${{ secrets.E2E_GHPOOL_PAT }}
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
         run: ./scripts/e2e-mcp.sh
       - name: Upload ghpool server log on failure
         if: failure()
