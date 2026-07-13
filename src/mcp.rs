@@ -92,36 +92,89 @@ pub async fn mcp_proxy(
         Err(code) => return rpc_error(code, "no upstream identity available"),
     };
 
-    // Audit log + default-deny tool allowlist (single frame parse)
+    // Audit log + policy enforcement (single frame parse)
     if method == Method::POST {
-        if let Some((rpc_method, tool)) = frame_summary(&body) {
-            // Phase 2a enforcement: authenticated agents may only call tools
-            // on their allowlist. This is the authoritative check; the
-            // injected X-MCP-Tools header is defense-in-depth.
-            if rpc_method == "tools/call" {
-                if let (Some(agent), Some(tool_name)) = (agent, tool.as_deref()) {
-                    if !agent.tools.iter().any(|t| t == tool_name) {
-                        tracing::warn!(
-                            "MCP tools/call {} DENIED [agent={}]{}",
-                            tool_name, agent.id, session_suffix(session_id.as_deref())
-                        );
-                        return rpc_error(
-                            StatusCode::FORBIDDEN,
-                            "tool not permitted by agent policy",
-                        );
+        if let Some(frame) = parse_frame(&body) {
+            if frame.method == "tools/call" {
+                if let Some(tool_name) = frame.tool.as_deref() {
+                    let repo = crate::policy::resolve_repo(frame.arguments.as_ref());
+                    if let Some(agent) = agent {
+                        // 1. Default-deny tool allowlist (authoritative)
+                        if !agent.tools.iter().any(|t| t == tool_name) {
+                            tracing::warn!(
+                                "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
+                                tool_name, agent.id, session_suffix(session_id.as_deref())
+                            );
+                            return rpc_error(
+                                StatusCode::FORBIDDEN,
+                                "tool not permitted by agent policy",
+                            );
+                        }
+                        // 2. Write classification: ALL write-classified tools
+                        //    are blocked until the write path ships (2b-5).
+                        //    Unknown tools classify as writes (conservative).
+                        if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write {
+                            tracing::warn!(
+                                "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
+                                tool_name, agent.id, session_suffix(session_id.as_deref())
+                            );
+                            return rpc_error(
+                                StatusCode::FORBIDDEN,
+                                "write tools are not enabled",
+                            );
+                        }
+                        // 3. Repository allowlist (deny-if-unresolvable)
+                        if !agent.repos.is_empty() {
+                            match &repo {
+                                None => {
+                                    tracing::warn!(
+                                        "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
+                                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                                    );
+                                    return rpc_error(
+                                        StatusCode::FORBIDDEN,
+                                        "call has no resolvable repository target",
+                                    );
+                                }
+                                Some((owner, repo_name)) => {
+                                    if !crate::policy::repo_allowed(&agent.repos, owner, repo_name) {
+                                        tracing::warn!(
+                                            "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
+                                            tool_name, owner, repo_name, agent.id,
+                                            session_suffix(session_id.as_deref())
+                                        );
+                                        return rpc_error(
+                                            StatusCode::FORBIDDEN,
+                                            "repository not permitted by agent policy",
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
+                    let repo_suffix = repo
+                        .map(|(o, r)| format!(" repo={}/{}", o, r))
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "MCP tools/call {}{} [{}]{}",
+                        tool_name, repo_suffix,
+                        audit_via(agent, &identity.id),
+                        session_suffix(session_id.as_deref())
+                    );
+                } else {
+                    tracing::info!(
+                        "MCP tools/call [{}]{}",
+                        audit_via(agent, &identity.id),
+                        session_suffix(session_id.as_deref())
+                    );
                 }
-            }
-            let via = audit_via(agent, &identity.id);
-            match tool {
-                Some(t) => tracing::info!(
-                    "MCP {} {} [{}]{}",
-                    rpc_method, t, via, session_suffix(session_id.as_deref())
-                ),
-                None => tracing::info!(
+            } else {
+                tracing::info!(
                     "MCP {} [{}]{}",
-                    rpc_method, via, session_suffix(session_id.as_deref())
-                ),
+                    frame.method,
+                    audit_via(agent, &identity.id),
+                    session_suffix(session_id.as_deref())
+                );
             }
         }
     }
@@ -383,20 +436,31 @@ fn build_upstream_headers(
     Some(h)
 }
 
-/// Best-effort parse of a JSON-RPC request frame.
-/// Returns (method, tool_name) where tool_name is set for tools/call.
-fn frame_summary(body: &[u8]) -> Option<(String, Option<String>)> {
+/// A best-effort parse of a JSON-RPC request frame.
+struct Frame {
+    method: String,
+    /// Tool name, for `tools/call` frames.
+    tool: Option<String>,
+    /// Tool arguments, for `tools/call` frames.
+    arguments: Option<serde_json::Value>,
+}
+
+fn parse_frame(body: &[u8]) -> Option<Frame> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let method = v.get("method")?.as_str()?.to_string();
-    let tool = if method == "tools/call" {
-        v.get("params")
-            .and_then(|p| p.get("name"))
-            .and_then(|n| n.as_str())
-            .map(str::to_string)
+    let (tool, arguments) = if method == "tools/call" {
+        let params = v.get("params");
+        (
+            params
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+            params.and_then(|p| p.get("arguments")).cloned(),
+        )
     } else {
-        None
+        (None, None)
     };
-    Some((method, tool))
+    Some(Frame { method, tool, arguments })
 }
 
 fn session_suffix(session_id: Option<&str>) -> String {
@@ -427,6 +491,7 @@ mod tests {
             key: None,
             keys: vec![key.to_string()],
             tools: tools.iter().map(|s| s.to_string()).collect(),
+            repos: Vec::new(),
         }
     }
 
@@ -476,25 +541,27 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_summary_tools_call() {
-        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_issue","arguments":{"owner":"openabdev"}}}"#;
-        let (method, tool) = frame_summary(body).unwrap();
-        assert_eq!(method, "tools/call");
-        assert_eq!(tool.as_deref(), Some("get_issue"));
+    fn test_parse_frame_tools_call() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_issue","arguments":{"owner":"openabdev","repo":"ghpool"}}}"#;
+        let f = parse_frame(body).unwrap();
+        assert_eq!(f.method, "tools/call");
+        assert_eq!(f.tool.as_deref(), Some("get_issue"));
+        assert_eq!(f.arguments.unwrap()["owner"], "openabdev");
     }
 
     #[test]
-    fn test_frame_summary_initialize() {
+    fn test_parse_frame_initialize() {
         let body = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
-        let (method, tool) = frame_summary(body).unwrap();
-        assert_eq!(method, "initialize");
-        assert!(tool.is_none());
+        let f = parse_frame(body).unwrap();
+        assert_eq!(f.method, "initialize");
+        assert!(f.tool.is_none());
+        assert!(f.arguments.is_none());
     }
 
     #[test]
-    fn test_frame_summary_invalid() {
-        assert!(frame_summary(b"not json").is_none());
-        assert!(frame_summary(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#).is_none());
+    fn test_parse_frame_invalid() {
+        assert!(parse_frame(b"not json").is_none());
+        assert!(parse_frame(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#).is_none());
     }
 
     #[test]
@@ -1125,5 +1192,153 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ---- 2b-2: write classification + repo allowlists ----
+
+    fn agent_with_repos(
+        id: &str,
+        key: &str,
+        tools: &[&str],
+        repos: &[&str],
+    ) -> config::McpAgentConfig {
+        let mut a = agent(id, key, tools);
+        a.repos = repos.iter().map(|s| s.to_string()).collect();
+        a
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_blocked_even_when_allowlisted() {
+        // Operator mistake: create_issue on the allowlist while writes are
+        // not enabled → still 403, never reaches upstream.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["issue_read", "create_issue"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"x"}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("write tools"));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_repo_allowlist_allows_matching_repo() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/ghpool"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"ghpool","issue_number":15}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_repo_allowlist_denies_other_repo() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/ghpool"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_repo_allowlist_denies_unresolvable_target() {
+        // search_code has no owner/repo arguments → deny-if-unresolvable
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent_with_repos("bot-a", "key-a", &["search_code"], &["openabdev/*"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"foo"}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("no resolvable repository"));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_repo_allowlist_wildcard_owner() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/*"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"anything","issue_number":1}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_empty_repos_is_unrestricted_and_search_passes() {
+        // Backward compat: 2a-style agent (no repos) can use repo-less tools
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["search_code"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"foo"}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_phase1_mode_unaffected_by_write_classification() {
+        // No agents → Phase 1 network-trust mode: the readonly upstream is
+        // the write barrier; ghpool does not block (backward compatible).
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"o","repo":"r","title":"t"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 }

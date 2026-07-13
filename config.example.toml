@@ -65,6 +65,11 @@ enabled = false
 # key = "aws:secretsmanager:ghpool/mcp-keys:openab"   # or env:GHPOOL_KEY_OPENAB
 # # keys = ["env:GHPOOL_KEY_OPENAB", "env:GHPOOL_KEY_OPENAB_NEXT"]  # rotation
 # tools = ["issue_read", "list_issues", "pull_request_read"]
+# # Repository allowlist: "owner/repo" exact or "owner/*" wildcard.
+# # Non-empty = every tools/call must resolve to a listed repo from its
+# # arguments; calls with no repo target (e.g. search_code, get_me) are
+# # DENIED. Empty/omitted = no repository restriction.
+# repos = ["openabdev/ghpool", "oablab/*"]
 #
 # [[mcp.agents]]
 # id = "ci-agent"
