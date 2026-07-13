@@ -99,6 +99,12 @@ pub struct McpAgentConfig {
     /// proxy; the same list is injected upstream as X-MCP-Tools.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Repository allowlist: `owner/repo` (exact) or `owner/*` entries.
+    /// When non-empty, every tools/call must resolve to an allowlisted repo
+    /// from its arguments; calls with no resolvable repo target are DENIED
+    /// (deny-if-unresolvable). Empty = no repository restriction.
+    #[serde(default)]
+    pub repos: Vec<String>,
 }
 
 impl Default for McpConfig {
