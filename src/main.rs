@@ -32,6 +32,8 @@ struct AppState {
     /// Durable audit sink for write-classified MCP calls (2b). None = audit
     /// not configured (writes cannot be enabled without it).
     audit: Option<audit::AuditSink>,
+    /// Per-agent in-flight write call counters (2b-5 concurrency cap).
+    write_inflight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
 }
 
 #[tokio::main]
@@ -79,6 +81,7 @@ async fn main() {
             .build(),
         app_tokens,
         audit,
+        write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     let mut app = Router::new()
@@ -89,7 +92,11 @@ async fn main() {
         .route("/{*path}", get(proxy));
 
     if config.mcp.enabled {
-        tracing::info!("MCP reverse proxy enabled → {}", config.mcp.upstream);
+        config.mcp.validate().expect("invalid [mcp] config");
+        tracing::info!("MCP reverse proxy enabled → {}", config.mcp.upstream());
+        if config.mcp.enable_writes {
+            tracing::warn!("MCP WRITE tools enabled for authenticated agents (audited, App-backed)");
+        }
         app = app.route(
             "/mcp",
             post(mcp::mcp_proxy)
@@ -424,6 +431,7 @@ mod tests {
             mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
             app_tokens: None,
             audit: None,
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 

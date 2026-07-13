@@ -41,7 +41,16 @@ raw_max_bytes = 268435456  # 256 MiB — total byte budget, enforced via weigher
 #   { "url": "http://ghpool:8080/mcp" }
 [mcp]
 enabled = false
-# Upstream MCP endpoint. Default is GitHub's hosted read-only variant.
+# Enable WRITE tools for authenticated agents (Phase 2b-5). Startup fails
+# unless [[mcp.agents]], [mcp.github_app] AND [mcp.audit] are all configured
+# — writes are never available in network-trust mode, never run on pooled
+# PATs, and are always fail-closed audited. When set, the default upstream
+# switches to the full write-capable surface.
+# enable_writes = false
+# Max concurrent write calls per agent (0 = unlimited).
+# max_inflight_writes = 4
+# Upstream MCP endpoint. Default: hosted read-only variant, or the full
+# surface when enable_writes is set.
 # upstream = "https://api.githubcopilot.com/mcp/readonly"
 # Optional toolset restriction (X-MCP-Toolsets header). Only used when no
 # [[mcp.agents]] are configured.

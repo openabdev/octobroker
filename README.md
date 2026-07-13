@@ -257,7 +257,7 @@ If a mutation request has no `Authorization` header, ghpool returns `401`.
 
 Reverse proxy to [GitHub's hosted MCP server](https://github.com/github/github-mcp-server): agents connect a Model Context Protocol client to ghpool and get GitHub's official MCP tools — **with no GitHub credential on the agent**. ghpool strips any client `Authorization` header and injects a pooled credential upstream.
 
-> **Status: read-only.** The upstream is pinned to the `/readonly` tool surface. Per-agent authentication and default-deny tool allowlists are available (Phase 2a below). Write access ships with the rest of Phase 2 — see the [RFC](https://github.com/openabdev/ghpool/issues/15).
+> **Status: writes available behind a hard gate.** Read-only by default; `enable_writes` unlocks write tools for authenticated agents only, and requires the GitHub App backend plus fail-closed audit (validated at startup). See the [RFC](https://github.com/openabdev/ghpool/issues/15).
 
 ```
 ┌───────────────── Private Network / VPC ─────────────────┐
@@ -330,6 +330,48 @@ Client config gains one line:
 ```
 
 Deliver `GHPOOL_KEY` to the agent container via ECS task secrets / K8s Secrets — most MCP clients expand `${ENV}` in config.
+
+#### Write access (Phase 2b)
+
+```toml
+[mcp]
+enabled = true
+enable_writes = true          # startup FAILS unless all three sections below exist
+# max_inflight_writes = 4     # per-agent write concurrency cap (0 = unlimited)
+
+[mcp.github_app]              # writes never run on pooled PATs
+app_id = "123456"
+private_key = "aws:secretsmanager:ghpool/app:private_key"
+owner = "openabdev"
+
+[mcp.audit]                   # writes are fail-closed audited
+path = "/var/lib/ghpool/mcp-audit.jsonl"
+
+[[mcp.agents]]                # writes are only for authenticated agents
+id = "openab-bot"
+key = "aws:secretsmanager:ghpool/mcp-keys:openab"
+tools = ["issue_read", "create_issue", "add_issue_comment"]
+repos = ["openabdev/ghpool", "openabdev/openab"]
+```
+
+How the write path is bounded:
+
+- **Default-deny stack**: agent key → tool allowlist → write classification → repo allowlist (deny-if-unresolvable) → per-agent in-flight cap → fail-closed audit record → forward.
+- **Scoped credentials**: when an agent's `repos` are all exact entries under one owner, its installation token is minted with the API's `repositories` parameter — **GitHub itself enforces the repo boundary**, independent of ghpool's argument parsing. Wildcard or mixed-owner allowlists fall back to an installation-wide token (proxy-side checks still apply).
+- **Audit**: two fsync'd JSONL records per write (pre-flight + result). The result captures the MCP tool outcome (`result.isError`) — HTTP 200 alone is not treated as success. If the pre-flight record cannot be persisted, the write is rejected (503) without reaching GitHub. Argument values are never recorded.
+- **No auto-retry**: ghpool never retries a forwarded call; an ambiguous write outcome (e.g. connection lost mid-response) is recorded as undeterminable and surfaced to the client — retry decisions belong to the caller.
+- **Revocation**: session pins live in process memory; key rotation uses dual `keys`, and any config change (agent disabled, policy tightened) takes effect by restart, which clears all sessions. Upstream session DELETE is a no-op at GitHub — ghpool's pin cache is the session authority.
+
+Required GitHub App permissions (grant only what your agents' tools need):
+
+| Tools | App permission |
+|-------|----------------|
+| `issue_read`, `list_issues`, `create_issue`, `add_issue_comment` | Issues: read / write |
+| `pull_request_read`, `create_pull_request`, `merge_pull_request` | Pull requests: read / write |
+| `get_file_contents`, `create_or_update_file`, `push_files` | Contents: read / write |
+| `list_workflows`, `run_workflow` | Actions: read / write |
+
+The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/ghpool/issues/22)) — grant conservatively and expand as agents need more.
 
 Deployment notes:
 

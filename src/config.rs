@@ -64,9 +64,16 @@ impl Default for CacheConfig {
 pub struct McpConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant.
-    #[serde(default = "default_mcp_upstream")]
-    pub upstream: String,
+    /// Enable write tools for authenticated agents (Phase 2b-5).
+    /// Hard requirements, validated at startup: [[mcp.agents]] non-empty,
+    /// [mcp.github_app] configured (writes never run on pooled PATs), and
+    /// [mcp.audit] configured (writes are fail-closed audited).
+    #[serde(default)]
+    pub enable_writes: bool,
+    /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,
+    /// or the full write-capable surface when enable_writes is set.
+    #[serde(default)]
+    pub upstream: Option<String>,
     /// Optional toolset restriction, injected as X-MCP-Toolsets header.
     /// Only used when no [[mcp.agents]] are configured (Phase 1 mode).
     #[serde(default)]
@@ -74,6 +81,9 @@ pub struct McpConfig {
     /// Idle TTL for session → identity pinning.
     #[serde(default = "default_mcp_session_ttl")]
     pub session_ttl_secs: u64,
+    /// Max concurrent write calls per agent (in-flight cap). 0 = unlimited.
+    #[serde(default = "default_mcp_max_inflight_writes")]
+    pub max_inflight_writes: usize,
     /// Per-agent authentication + default-deny tool allowlists (Phase 2a).
     /// Empty = Phase 1 network-trust mode (no agent authn on /mcp).
     /// Non-empty = every /mcp request must present a valid X-Ghpool-Key.
@@ -153,9 +163,11 @@ impl Default for McpConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            upstream: default_mcp_upstream(),
+            enable_writes: false,
+            upstream: None,
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
+            max_inflight_writes: default_mcp_max_inflight_writes(),
             agents: Vec::new(),
             github_app: None,
             audit: None,
@@ -163,10 +175,42 @@ impl Default for McpConfig {
     }
 }
 
+impl McpConfig {
+    /// Effective upstream: explicit config wins; otherwise the read-only
+    /// variant, or the full write-capable surface when writes are enabled.
+    pub fn upstream(&self) -> String {
+        if let Some(u) = &self.upstream {
+            return u.clone();
+        }
+        if self.enable_writes {
+            "https://api.githubcopilot.com/mcp/".to_string()
+        } else {
+            default_mcp_upstream()
+        }
+    }
+
+    /// Startup validation of the write gate's hard requirements.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enable_writes {
+            if self.agents.is_empty() {
+                return Err("enable_writes requires [[mcp.agents]] — writes are never available in network-trust mode".into());
+            }
+            if self.github_app.is_none() {
+                return Err("enable_writes requires [mcp.github_app] — writes never run on pooled PATs".into());
+            }
+            if self.audit.is_none() {
+                return Err("enable_writes requires [mcp.audit] — writes are fail-closed audited".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_mcp_upstream() -> String {
     "https://api.githubcopilot.com/mcp/readonly".to_string()
 }
 fn default_mcp_session_ttl() -> u64 { 3600 }
+fn default_mcp_max_inflight_writes() -> usize { 4 }
 
 fn default_port() -> u16 { 8080 }
 fn default_max_entries() -> u64 { 10000 }
@@ -429,5 +473,34 @@ mod tests {
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::set_current_dir(orig_cwd).unwrap();
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_mcp_validate_write_gate() {
+        let mut m = McpConfig { enabled: true, enable_writes: true, ..Default::default() };
+        assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
+        m.agents.push(McpAgentConfig {
+            id: "a".into(), key: None, keys: vec!["k".into()], tools: vec![], repos: vec![],
+        });
+        assert!(m.validate().unwrap_err().contains("github_app"));
+        m.github_app = Some(GithubAppConfig {
+            app_id: "1".into(), private_key: "pem".into(), installation_id: Some(1), owner: None,
+        });
+        assert!(m.validate().unwrap_err().contains("audit"));
+        m.audit = Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 });
+        assert!(m.validate().is_ok());
+        // reads-only config never requires anything
+        let m = McpConfig { enabled: true, ..Default::default() };
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_upstream_default_flips_with_writes() {
+        let m = McpConfig::default();
+        assert!(m.upstream().ends_with("/readonly"));
+        let m = McpConfig { enable_writes: true, ..Default::default() };
+        assert_eq!(m.upstream(), "https://api.githubcopilot.com/mcp/");
+        let m = McpConfig { upstream: Some("http://x/".into()), enable_writes: true, ..Default::default() };
+        assert_eq!(m.upstream(), "http://x/");
     }
 }

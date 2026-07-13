@@ -76,7 +76,7 @@ pub async fn mcp_proxy(
     }
 
     let agent_id = agent.map(|a| a.id.as_str());
-    let cred = match pick_credential(&state, session_id.as_deref(), agent_id).await {
+    let cred = match pick_credential(&state, session_id.as_deref(), agent).await {
         Ok(c) => c,
         Err(StatusCode::NOT_FOUND) => {
             // Per MCP Streamable HTTP spec: unknown/expired sessions get 404,
@@ -117,10 +117,14 @@ pub async fn mcp_proxy(
                             "tool not permitted by agent policy",
                         );
                     }
-                    // 2. Write classification: ALL write-classified tools
-                    //    are blocked until the write path ships (2b-5).
-                    //    Unknown tools classify as writes (conservative).
-                    if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write {
+                    // 2. Write classification (unknown names → Write,
+                    //    conservative). Writes require the enable_writes
+                    //    gate, which startup validation ties to the App
+                    //    backend + fail-closed audit (never PATs, never
+                    //    unaudited).
+                    if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write
+                        && !state.config.mcp.enable_writes
+                    {
                         tracing::warn!(
                             "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
                             tool_name, agent.id, session_suffix(session_id.as_deref())
@@ -198,6 +202,28 @@ pub async fn mcp_proxy(
             })
             .map(str::to_string)
     });
+    // Per-agent in-flight cap on write calls (held until the buffered
+    // response is fully assembled; the guard decrements on drop).
+    let _inflight: Option<InFlightGuard> = match (&write_call, agent_id) {
+        (Some(_), Some(aid)) => {
+            let cap = state.config.mcp.max_inflight_writes;
+            match InFlightGuard::try_acquire(&state.write_inflight, aid, cap) {
+                Some(g) => Some(g),
+                None => {
+                    tracing::warn!(
+                        "MCP write call rejected: agent {} at in-flight cap ({})",
+                        aid, cap
+                    );
+                    return rpc_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "agent write concurrency limit reached",
+                    );
+                }
+            }
+        }
+        _ => None,
+    };
+
     if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
         let call = crate::audit::CallInfo {
             rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
@@ -220,7 +246,7 @@ pub async fn mcp_proxy(
         }
     }
 
-    let upstream = &state.config.mcp.upstream;
+    let upstream = state.config.mcp.upstream();
     // Timeouts are method-specific: POST responses (including SSE tool-call
     // results) complete within a bounded window, but GET is the stream
     // resumption channel and may legitimately stay open indefinitely — a
@@ -231,7 +257,7 @@ pub async fn mcp_proxy(
             .post(upstream)
             .body(reqwest::Body::from(body))
             .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS)),
-        Method::GET => state.http.get(upstream),
+        Method::GET => state.http.get(&upstream),
         Method::DELETE => state
             .http
             .delete(upstream)
@@ -486,8 +512,9 @@ impl McpCredential {
 async fn pick_credential(
     state: &AppState,
     session_id: Option<&str>,
-    agent_id: Option<&str>,
+    agent: Option<&crate::config::McpAgentConfig>,
 ) -> Result<McpCredential, StatusCode> {
+    let agent_id = agent.map(|a| a.id.as_str());
     if let Some(sid) = session_id {
         if let Some(pin) = state.mcp_sessions.get(sid).await {
             if pin.agent_id.as_deref() != agent_id {
@@ -530,9 +557,13 @@ async fn pick_credential(
         }
         return Err(StatusCode::NOT_FOUND);
     }
-    // New session: App backend takes precedence when configured
+    // New session: App backend takes precedence when configured. The token
+    // is scoped to the agent's repo envelope when possible (exact entries,
+    // single owner) so GitHub itself enforces the repository boundary; the
+    // proxy-side repo check remains as defense-in-depth.
     if let Some(provider) = &state.app_tokens {
-        return match provider.token().await {
+        let envelope = scope_envelope(agent);
+        return match provider.token_scoped(&envelope).await {
             Ok(t) => Ok(McpCredential::App(t)),
             Err(e) => {
                 tracing::error!("App token mint failed: {}", e);
@@ -545,6 +576,66 @@ async fn pick_credential(
         .select()
         .map(McpCredential::Pat)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+/// Repository names for a scoped token mint: only when the agent's repo
+/// allowlist consists entirely of exact `owner/repo` entries under a single
+/// owner (the installation's). Wildcards, mixed owners, or no restriction
+/// fall back to an installation-wide token.
+fn scope_envelope(agent: Option<&crate::config::McpAgentConfig>) -> Vec<String> {
+    let Some(a) = agent else { return Vec::new() };
+    if a.repos.is_empty() {
+        return Vec::new();
+    }
+    let mut owner0: Option<&str> = None;
+    let mut names = Vec::new();
+    for entry in &a.repos {
+        match entry.split_once('/') {
+            Some((o, r)) if r != "*" && !r.is_empty() => {
+                if *owner0.get_or_insert(o) != o {
+                    return Vec::new(); // mixed owners → installation-wide
+                }
+                names.push(r.to_string());
+            }
+            _ => return Vec::new(), // wildcard/malformed → installation-wide
+        }
+    }
+    names
+}
+
+/// RAII in-flight counter for per-agent write concurrency caps.
+struct InFlightGuard {
+    map: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    key: String,
+}
+
+impl InFlightGuard {
+    /// None when the agent is already at the cap.
+    fn try_acquire(
+        map: &Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+        key: &str,
+        cap: usize,
+    ) -> Option<Self> {
+        let mut m = map.lock().unwrap();
+        let count = m.entry(key.to_string()).or_insert(0);
+        if cap > 0 && *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(Self { map: map.clone(), key: key.to_string() })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(c) = m.get_mut(&self.key) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Phase 2a agent authentication.
@@ -756,9 +847,11 @@ mod tests {
                 cache: cache_config,
                 mcp: config::McpConfig {
                     enabled: true,
-                    upstream: upstream.to_string(),
+                    enable_writes: false,
+                    upstream: Some(upstream.to_string()),
                     toolsets: toolsets.iter().map(|s| s.to_string()).collect(),
                     session_ttl_secs: 3600,
+                    max_inflight_writes: 4,
                     agents,
                     github_app: None,
                     audit: None,
@@ -769,6 +862,7 @@ mod tests {
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: None,
             audit: None,
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1633,9 +1727,11 @@ mod tests {
                 cache: cache_config,
                 mcp: config::McpConfig {
                     enabled: true,
-                    upstream: upstream.to_string(),
+                    enable_writes: false,
+                    upstream: Some(upstream.to_string()),
                     toolsets: vec![],
                     session_ttl_secs: 3600,
+                    max_inflight_writes: 4,
                     agents: vec![],
                     github_app: None, // provider injected directly below
                     audit: None,
@@ -1646,6 +1742,7 @@ mod tests {
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: Some(provider),
             audit: None,
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1757,9 +1854,11 @@ mod tests {
                 cache: cache_config,
                 mcp: config::McpConfig {
                     enabled: true,
-                    upstream: upstream.to_string(),
+                    enable_writes: false,
+                    upstream: Some(upstream.to_string()),
                     toolsets: vec![],
                     session_ttl_secs: 3600,
+                    max_inflight_writes: 4,
                     agents: vec![],
                     github_app: None,
                     audit: Some(config::AuditConfig { path: "unused".into(), max_result_bytes: cap }),
@@ -1770,6 +1869,7 @@ mod tests {
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: None,
             audit: Some(sink),
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1902,6 +2002,172 @@ mod tests {
         let records = read_audit(&path);
         assert_eq!(records[1]["phase"], "result");
         assert_eq!(records[1]["tool_error"], serde_json::Value::Null);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- 2b-5: enable writes ----
+
+    #[test]
+    fn test_scope_envelope() {
+        // exact entries, single owner → repo names
+        let a = agent_with_repos("a", "k", &[], &["openabdev/ghpool", "openabdev/openab"]);
+        assert_eq!(scope_envelope(Some(&a)), vec!["ghpool", "openab"]);
+        // wildcard → installation-wide
+        let a = agent_with_repos("a", "k", &[], &["openabdev/*"]);
+        assert!(scope_envelope(Some(&a)).is_empty());
+        // mixed owners → installation-wide
+        let a = agent_with_repos("a", "k", &[], &["openabdev/ghpool", "oablab/chi"]);
+        assert!(scope_envelope(Some(&a)).is_empty());
+        // no restriction → installation-wide
+        let a = agent("a", "k", &[]);
+        assert!(scope_envelope(Some(&a)).is_empty());
+        assert!(scope_envelope(None).is_empty());
+    }
+
+    fn test_state_writes_enabled(
+        upstream: &str,
+        sink: crate::audit::AuditSink,
+        agents: Vec<config::McpAgentConfig>,
+        max_inflight: usize,
+    ) -> Arc<AppState> {
+        let cache_config = config::CacheConfig::default();
+        let identities = vec![config::IdentityConfig { id: "alice".into(), token: "token-alice".into() }];
+        Arc::new(AppState {
+            pool: pool::PatPool::new(&identities),
+            cache: cache::Cache::new(&cache_config),
+            config: config::Config {
+                port: 8080,
+                identities,
+                allowed_owners: vec!["openabdev".to_string()],
+                cache: cache_config,
+                mcp: config::McpConfig {
+                    enabled: true,
+                    enable_writes: true,
+                    upstream: Some(upstream.to_string()),
+                    toolsets: vec![],
+                    session_ttl_secs: 3600,
+                    max_inflight_writes: max_inflight,
+                    agents,
+                    github_app: None, // PAT creds acceptable for unit tests
+                    audit: Some(config::AuditConfig { path: "unused".into(), max_result_bytes: 1024 * 1024 }),
+                },
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: None,
+            audit: Some(sink),
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_write_allowed_when_enabled_with_audit_trail() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("write-enabled");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url, sink,
+            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/ghpool"])],
+            4,
+        );
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"t"}}}"#,
+                &[("x-ghpool-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // upstream reached, with the exact allowlist injected
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].tools_hdr.as_deref(), Some("create_issue"));
+        drop(reqs);
+        // audit: request + result records with agent attribution
+        let records = read_audit(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["agent"], "bot-w");
+        assert_eq!(records[1]["tool_error"], false);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_write_still_denied_off_allowlist_or_repo() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("write-denied");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url, sink,
+            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/ghpool"])],
+            4,
+        );
+        // wrong repo → 403 even with writes enabled
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"evil","repo":"other","title":"t"}}}"#,
+                &[("x-ghpool-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // tool off allowlist → 403
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_file","arguments":{"owner":"openabdev","repo":"ghpool"}}}"#,
+                &[("x-ghpool-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured.lock().unwrap().is_empty());
+        // denials never reach the durable audit (pre-flight is post-policy)
+        let denied_path = audit_tmp("write-denied");
+        assert!(read_audit(&denied_path).is_empty());
+        std::fs::remove_file(&denied_path).ok();
+    }
+
+    #[test]
+    fn test_inflight_guard_cap_and_release() {
+        let map = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let g1 = InFlightGuard::try_acquire(&map, "bot-a", 2);
+        let g2 = InFlightGuard::try_acquire(&map, "bot-a", 2);
+        assert!(g1.is_some() && g2.is_some());
+        // at cap
+        assert!(InFlightGuard::try_acquire(&map, "bot-a", 2).is_none());
+        // other agents unaffected
+        assert!(InFlightGuard::try_acquire(&map, "bot-b", 2).is_some());
+        // release frees a slot
+        drop(g1);
+        assert!(InFlightGuard::try_acquire(&map, "bot-a", 2).is_some());
+        // cap 0 = unlimited
+        for _ in 0..10 {
+            assert!(InFlightGuard::try_acquire(&map, "bot-c", 0).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_rejected_at_inflight_cap() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("cap");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url, sink,
+            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/ghpool"])],
+            1,
+        );
+        // Saturate the cap by holding a guard, then issue a write
+        let _held = InFlightGuard::try_acquire(&state.write_inflight, "bot-w", 1).unwrap();
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"t"}}}"#,
+                &[("x-ghpool-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(captured.lock().unwrap().is_empty());
         std::fs::remove_file(&path).ok();
     }
 }

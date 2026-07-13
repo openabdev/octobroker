@@ -13,6 +13,7 @@
 //! → { token, expires_at }. The installation id is configured explicitly
 //! or discovered once from the owner (org/user) at first use.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,7 +38,9 @@ pub struct AppTokenProvider {
     owner: Option<String>,
     api_base: String,
     http: reqwest::Client,
-    cached: Mutex<Option<AppToken>>,
+    /// Cache keyed by scope envelope ("" = installation-wide; otherwise the
+    /// sorted repo list). One credential per policy envelope.
+    cached: Mutex<HashMap<String, AppToken>>,
 }
 
 #[derive(Deserialize)]
@@ -73,24 +76,38 @@ impl AppTokenProvider {
             owner,
             api_base,
             http: reqwest::Client::new(),
-            cached: Mutex::new(None),
+            cached: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Current token, minting/refreshing if absent or near expiry.
+    /// Installation-wide token, minting/refreshing if absent or near expiry.
+    /// (Equivalent to `token_scoped(&[])`; kept for tests and future callers.)
+    #[cfg(test)]
     pub async fn token(&self) -> Result<AppToken, String> {
+        self.token_scoped(&[]).await
+    }
+
+    /// Token scoped to a repository envelope (2b-5, per community review):
+    /// minted with the API's `repositories` parameter so GitHub itself
+    /// enforces the boundary. Empty slice = installation-wide. Tokens are
+    /// cached per envelope and refreshed near expiry.
+    pub async fn token_scoped(&self, repositories: &[String]) -> Result<AppToken, String> {
+        let mut envelope: Vec<String> = repositories.to_vec();
+        envelope.sort();
+        let key = envelope.join(",");
+
         let now = unix_now();
-        if let Some(t) = self.cached.lock().unwrap().clone() {
+        if let Some(t) = self.cached.lock().unwrap().get(&key) {
             if t.expires_at > now + REFRESH_MARGIN.as_secs() {
-                return Ok(t);
+                return Ok(t.clone());
             }
         }
-        let fresh = self.mint().await?;
-        *self.cached.lock().unwrap() = Some(fresh.clone());
+        let fresh = self.mint(&envelope).await?;
+        self.cached.lock().unwrap().insert(key, fresh.clone());
         Ok(fresh)
     }
 
-    async fn mint(&self) -> Result<AppToken, String> {
+    async fn mint(&self, repositories: &[String]) -> Result<AppToken, String> {
         let jwt = self.sign_jwt()?;
         let installation_id = self.resolve_installation(&jwt).await?;
 
@@ -98,12 +115,18 @@ impl AppTokenProvider {
             "{}/app/installations/{}/access_tokens",
             self.api_base, installation_id
         );
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")));
+        if !repositories.is_empty() {
+            // Scope the token to explicit repositories (names within the
+            // installation's owner). GitHub rejects unknown repos at mint.
+            req = req.json(&serde_json::json!({ "repositories": repositories }));
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| format!("token mint request failed: {}", e))?;
@@ -125,8 +148,9 @@ impl AppTokenProvider {
             .ok_or_else(|| format!("unparsable expires_at: {}", tr.expires_at))?;
 
         tracing::info!(
-            "minted GitHub App installation token (installation={}, expires in {}s)",
+            "minted GitHub App installation token (installation={}, scope={}, expires in {}s)",
             installation_id,
+            if repositories.is_empty() { "installation-wide".to_string() } else { repositories.join(",") },
             expires_at.saturating_sub(unix_now())
         );
         Ok(AppToken { token: tr.token, expires_at })
@@ -285,12 +309,24 @@ pub(crate) mod tests {
         assert_eq!(MINTS.load(Ordering::SeqCst), 1);
 
         // Force near-expiry → refresh mints again
-        *p.cached.lock().unwrap() = Some(AppToken {
-            token: "ghs_mock_1".into(),
-            expires_at: unix_now() + 10, // inside REFRESH_MARGIN
-        });
+        p.cached.lock().unwrap().insert(
+            String::new(),
+            AppToken { token: "ghs_mock_1".into(), expires_at: unix_now() + 10 },
+        );
         let t3 = p.token().await.unwrap();
         assert_eq!(t3.token, "ghs_mock_2");
         assert_eq!(MINTS.load(Ordering::SeqCst), 2);
+
+        // Scoped envelopes are cached independently of installation-wide
+        let s1 = p.token_scoped(&["ghpool".into()]).await.unwrap();
+        assert_eq!(s1.token, "ghs_mock_3");
+        // same envelope (different order) hits the cache
+        let s2 = p.token_scoped(&["ghpool".into()]).await.unwrap();
+        assert_eq!(s2.token, "ghs_mock_3");
+        assert_eq!(MINTS.load(Ordering::SeqCst), 3);
+        // different envelope mints separately
+        let s3 = p.token_scoped(&["ghpool".into(), "openab".into()]).await.unwrap();
+        assert_eq!(s3.token, "ghs_mock_4");
+        assert_eq!(MINTS.load(Ordering::SeqCst), 4);
     }
 }
