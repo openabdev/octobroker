@@ -56,9 +56,14 @@ enabled = false
 # upstream as X-MCP-Tools. No entries = Phase 1 network-trust mode.
 #
 # Keys support the same secret references as identity tokens.
+# For zero-downtime rotation, use `keys` with two entries (both valid at
+# once): add the new key, roll agents over, remove the old key.
+# Sessions are bound to the agent that initialized them — a session ID
+# presented by a different agent is rejected (403).
 # [[mcp.agents]]
 # id = "openab-bot"
 # key = "aws:secretsmanager:ghpool/mcp-keys:openab"   # or env:GHPOOL_KEY_OPENAB
+# # keys = ["env:GHPOOL_KEY_OPENAB", "env:GHPOOL_KEY_OPENAB_NEXT"]  # rotation
 # tools = ["issue_read", "list_issues", "pull_request_read"]
 #
 # [[mcp.agents]]

@@ -21,8 +21,8 @@ struct AppState {
     config: config::Config,
     token_users: moka::future::Cache<String, String>,
     http: reqwest::Client,
-    /// MCP session pinning: Mcp-Session-Id → identity id
-    mcp_sessions: moka::future::Cache<String, String>,
+    /// MCP session pinning: Mcp-Session-Id → (pooled identity, agent binding)
+    mcp_sessions: moka::future::Cache<String, mcp::SessionPin>,
 }
 
 #[tokio::main]
