@@ -76,12 +76,110 @@ pub async fn mcp_proxy(
     }
 
     let agent_id = agent.map(|a| a.id.as_str());
-    let cred = match pick_credential(&state, session_id.as_deref(), agent).await {
+
+    // Parse frame early so we can resolve the target owner for multi-app mode.
+    let frame = if method == Method::POST { parse_frame(&body) } else { None };
+    let mut resolved_repo: Option<(String, String)> = None;
+    if let Some(f) = &frame {
+        if f.method == "tools/call" {
+            resolved_repo = crate::policy::resolve_repo(f.arguments.as_ref());
+        }
+    }
+
+    // Policy enforcement for tools/call — before credential resolution, so
+    // denied calls never mint or resolve an upstream credential.
+    if let Some(frame) = &frame {
+        if frame.method == "tools/call" {
+            if let (Some(tool_name), Some(agent)) = (frame.tool.as_deref(), agent) {
+                // 1. Default-deny tool allowlist (authoritative)
+                if !agent.tools.iter().any(|t| t == tool_name) {
+                    tracing::warn!(
+                        "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
+                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                    );
+                    return rpc_error(
+                        StatusCode::FORBIDDEN,
+                        "tool not permitted by agent policy",
+                    );
+                }
+                // 2. Write classification (unknown names → Write,
+                //    conservative). Writes require the enable_writes
+                //    gate, which startup validation ties to the App
+                //    backend + fail-closed audit (never PATs, never
+                //    unaudited).
+                if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write
+                    && !state.config.mcp.enable_writes
+                {
+                    tracing::warn!(
+                        "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
+                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                    );
+                    return rpc_error(
+                        StatusCode::FORBIDDEN,
+                        "write tools are not enabled",
+                    );
+                }
+                // 3. Repository allowlist (deny-if-unresolvable)
+                if !agent.repos.is_empty() {
+                    match &resolved_repo {
+                        None => {
+                            tracing::warn!(
+                                "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
+                                tool_name, agent.id, session_suffix(session_id.as_deref())
+                            );
+                            return rpc_error(
+                                StatusCode::FORBIDDEN,
+                                "call has no resolvable repository target",
+                            );
+                        }
+                        Some((owner, repo_name)) => {
+                            if !crate::policy::repo_allowed(&agent.repos, owner, repo_name) {
+                                tracing::warn!(
+                                    "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
+                                    tool_name, owner, repo_name, agent.id,
+                                    session_suffix(session_id.as_deref())
+                                );
+                                return rpc_error(
+                                    StatusCode::FORBIDDEN,
+                                    "repository not permitted by agent policy",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Multi-installation mode: `initialize` fans out to one upstream session
+    // per owner in the agent's envelope; DELETE and notifications fan out to
+    // every pinned route. Everything else is routed per-call below.
+    if state.multi_app_tokens.is_some() {
+        let frame_method = frame.as_ref().map(|f| f.method.as_str()).unwrap_or("");
+        if method == Method::POST && frame_method == "initialize" && session_id.is_none() {
+            let Some(agent) = agent else {
+                // Startup validation requires agents in multi mode, and
+                // authenticate() already rejected keyless requests.
+                return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required");
+            };
+            return multi_initialize(&state, &headers, body, agent).await;
+        }
+        if let Some(sid) = session_id.as_deref() {
+            if method == Method::DELETE
+                || (method == Method::POST && frame_method.starts_with("notifications/"))
+            {
+                if let Some(resp) = multi_fanout(&state, &method, &headers, &body, sid, agent).await
+                {
+                    return resp;
+                }
+            }
+        }
+    }
+
+    let route_owner = resolved_repo.as_ref().map(|(o, _)| o.as_str());
+    let cred = match pick_credential(&state, session_id.as_deref(), agent, route_owner).await {
         Ok(c) => c,
         Err(StatusCode::NOT_FOUND) => {
-            // Per MCP Streamable HTTP spec: unknown/expired sessions get 404,
-            // prompting the client to re-initialize. Never rotate identities
-            // mid-session.
             tracing::warn!(
                 "MCP request rejected: unknown or expired session{}",
                 session_suffix(session_id.as_deref())
@@ -96,73 +194,12 @@ pub async fn mcp_proxy(
         }
         Err(code) => return rpc_error(code, "no upstream identity available"),
     };
+    let cred_label = cred.label();
 
-    // Audit log + policy enforcement (single frame parse, kept for the
-    // write-audit path below)
-    let frame = if method == Method::POST { parse_frame(&body) } else { None };
-    let mut resolved_repo: Option<(String, String)> = None;
+    // Request logging
     if let Some(frame) = &frame {
         if frame.method == "tools/call" {
             if let Some(tool_name) = frame.tool.as_deref() {
-                resolved_repo = crate::policy::resolve_repo(frame.arguments.as_ref());
-                if let Some(agent) = agent {
-                    // 1. Default-deny tool allowlist (authoritative)
-                    if !agent.tools.iter().any(|t| t == tool_name) {
-                        tracing::warn!(
-                            "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
-                            tool_name, agent.id, session_suffix(session_id.as_deref())
-                        );
-                        return rpc_error(
-                            StatusCode::FORBIDDEN,
-                            "tool not permitted by agent policy",
-                        );
-                    }
-                    // 2. Write classification (unknown names → Write,
-                    //    conservative). Writes require the enable_writes
-                    //    gate, which startup validation ties to the App
-                    //    backend + fail-closed audit (never PATs, never
-                    //    unaudited).
-                    if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write
-                        && !state.config.mcp.enable_writes
-                    {
-                        tracing::warn!(
-                            "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
-                            tool_name, agent.id, session_suffix(session_id.as_deref())
-                        );
-                        return rpc_error(
-                            StatusCode::FORBIDDEN,
-                            "write tools are not enabled",
-                        );
-                    }
-                    // 3. Repository allowlist (deny-if-unresolvable)
-                    if !agent.repos.is_empty() {
-                        match &resolved_repo {
-                            None => {
-                                tracing::warn!(
-                                    "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
-                                    tool_name, agent.id, session_suffix(session_id.as_deref())
-                                );
-                                return rpc_error(
-                                    StatusCode::FORBIDDEN,
-                                    "call has no resolvable repository target",
-                                );
-                            }
-                            Some((owner, repo_name)) => {
-                                if !crate::policy::repo_allowed(&agent.repos, owner, repo_name) {
-                                    tracing::warn!(
-                                        "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
-                                        tool_name, owner, repo_name, agent.id,
-                                        session_suffix(session_id.as_deref())
-                                    );
-                                    return rpc_error(
-                                        StatusCode::FORBIDDEN,
-                                        "repository not permitted by agent policy",
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
                 let repo_suffix = resolved_repo
                     .as_ref()
                     .map(|(o, r)| format!(" repo={}/{}", o, r))
@@ -170,13 +207,13 @@ pub async fn mcp_proxy(
                 tracing::info!(
                     "MCP tools/call {}{} [{}]{}",
                     tool_name, repo_suffix,
-                    audit_via(agent, cred.label()),
+                    audit_via(agent, &cred_label),
                     session_suffix(session_id.as_deref())
                 );
             } else {
                 tracing::info!(
                     "MCP tools/call [{}]{}",
-                    audit_via(agent, cred.label()),
+                    audit_via(agent, &cred_label),
                     session_suffix(session_id.as_deref())
                 );
             }
@@ -184,7 +221,7 @@ pub async fn mcp_proxy(
             tracing::info!(
                 "MCP {} [{}]{}",
                 frame.method,
-                audit_via(agent, cred.label()),
+                audit_via(agent, &cred_label),
                 session_suffix(session_id.as_deref())
             );
         }
@@ -229,7 +266,7 @@ pub async fn mcp_proxy(
             rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
             session: session_id.as_deref(),
             agent: agent_id,
-            credential: cred.label(),
+            credential: &cred_label,
             tool: tool_name,
             repo: resolved_repo.as_ref(),
         };
@@ -265,15 +302,33 @@ pub async fn mcp_proxy(
         _ => return rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
     };
 
-    let Some(upstream_headers) =
+    let Some(mut upstream_headers) =
         build_upstream_headers(&headers, cred.token(), &state.config.mcp.toolsets, agent)
     else {
         tracing::error!(
             "credential '{}' is not a valid header value — check secret source",
-            cred.label()
+            cred_label
         );
         return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured");
     };
+    // Multi-installation routing: every installation has its own upstream
+    // session. Secondary routes replace the downstream session ID with their
+    // own; stateless routed calls carry no session at all. Tokens are never
+    // mixed within one upstream session.
+    if let McpCredential::Routed { upstream_session, .. } = &cred {
+        match upstream_session {
+            Some(us) if Some(us.as_str()) != session_id.as_deref() => {
+                let Ok(v) = us.parse() else {
+                    return rpc_error(StatusCode::BAD_GATEWAY, "invalid upstream session id");
+                };
+                upstream_headers.insert("mcp-session-id", v);
+            }
+            Some(_) => {}
+            None => {
+                upstream_headers.remove("mcp-session-id");
+            }
+        }
+    }
 
     let resp = match req.headers(upstream_headers).send().await {
         Ok(r) => r,
@@ -306,24 +361,24 @@ pub async fn mcp_proxy(
             tracing::warn!("MCP upstream 429 for identity {} — budget zeroed", identity.id);
         }
     } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        tracing::warn!("MCP upstream 429 on App installation token");
+        tracing::warn!("MCP upstream 429 on App installation token ({})", cred_label);
     }
 
     // Pin new sessions: upstream returns Mcp-Session-Id on initialize.
     // The pin binds the session to the exact credential and the agent that
-    // initialized it.
+    // initialized it. Routed credentials are never pinned here — their
+    // sessions are created by the multi-installation initialize fan-out.
     if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         if state.mcp_sessions.get(sid).await.is_none() {
-            tracing::info!(
-                "MCP session pinned to credential {}{}{}",
-                cred.label(),
-                agent_id.map(|a| format!(" [agent={}]", a)).unwrap_or_default(),
-                session_suffix(Some(sid))
-            );
-            state
-                .mcp_sessions
-                .insert(sid.to_string(), cred.to_pin(agent_id))
-                .await;
+            if let Some(new_pin) = cred.to_pin(agent_id) {
+                tracing::info!(
+                    "MCP session pinned to credential {}{}{}",
+                    cred_label,
+                    agent_id.map(|a| format!(" [agent={}]", a)).unwrap_or_default(),
+                    session_suffix(Some(sid))
+                );
+                state.mcp_sessions.insert(sid.to_string(), new_pin).await;
+            }
         }
     }
 
@@ -335,9 +390,23 @@ pub async fn mcp_proxy(
     }
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // A secondary route's upstream echoes ITS session ID; the client must
+    // only ever see the downstream session ID it initialized with.
+    let downstream_sid_override: Option<&str> = match (&cred, session_id.as_deref()) {
+        (McpCredential::Routed { upstream_session: Some(us), .. }, Some(dsid)) if us != dsid => {
+            Some(dsid)
+        }
+        _ => None,
+    };
     let mut builder = Response::builder().status(status);
     for name in RESP_HEADERS {
         if let Some(v) = resp.headers().get(*name) {
+            if *name == "mcp-session-id" {
+                if let Some(dsid) = downstream_sid_override {
+                    builder = builder.header(*name, dsid);
+                    continue;
+                }
+            }
             builder = builder.header(*name, v.clone());
         }
     }
@@ -364,7 +433,7 @@ pub async fn mcp_proxy(
             rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
             session: session_id.as_deref(),
             agent: agent_id,
-            credential: cred.label(),
+            credential: &cred_label,
             tool: tool_name,
             repo: resolved_repo.as_ref(),
         };
@@ -464,12 +533,42 @@ pub enum PinnedCred {
     /// using the token it started with (still valid upstream even after the
     /// provider refreshes) and dies at that token's expiry.
     App { token: String, expires_at: u64 },
+    /// Multi-installation mode: one pinned credential and one upstream
+    /// session per owner, all created eagerly at `initialize` (fan-out).
+    /// tools/call frames route by their resolved repository owner; the
+    /// session dies (404) when a needed route's token has expired — routes
+    /// are minted together, so expiries are effectively aligned.
+    MultiApp {
+        /// owner (lowercase) → pinned per-installation route.
+        routes: std::collections::HashMap<String, AppRoute>,
+        /// Owner whose upstream session ID doubles as the downstream
+        /// session ID; non-tools/call traffic is served by this route.
+        primary: String,
+    },
+}
+
+/// One installation's pinned credential + upstream session in multi mode.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppRoute {
+    pub token: String,
+    pub expires_at: u64,
+    /// Upstream session ID for this installation (None when the upstream
+    /// did not assign one — such routes are used statelessly).
+    pub upstream_session: Option<String>,
 }
 
 /// The upstream credential resolved for one request.
 pub enum McpCredential {
     Pat(pool::Identity),
     App(crate::app_token::AppToken),
+    /// Multi-installation route: the request is forwarded with this
+    /// installation's token, on this installation's own upstream session
+    /// (never mixing tokens within one upstream session).
+    Routed {
+        owner: String,
+        token: String,
+        upstream_session: Option<String>,
+    },
 }
 
 impl McpCredential {
@@ -477,26 +576,29 @@ impl McpCredential {
         match self {
             McpCredential::Pat(i) => &i.token,
             McpCredential::App(t) => &t.token,
+            McpCredential::Routed { token, .. } => token,
         }
     }
     /// Audit label for the credential.
-    fn label(&self) -> &str {
+    fn label(&self) -> String {
         match self {
-            McpCredential::Pat(i) => &i.id,
-            McpCredential::App(_) => "github-app",
+            McpCredential::Pat(i) => i.id.clone(),
+            McpCredential::App(_) => "github-app".to_string(),
+            McpCredential::Routed { owner, .. } => format!("github-app:{}", owner),
         }
     }
-    fn to_pin(&self, agent_id: Option<&str>) -> SessionPin {
-        SessionPin {
-            agent_id: agent_id.map(str::to_string),
-            cred: match self {
-                McpCredential::Pat(i) => PinnedCred::Pat { identity_id: i.id.clone() },
-                McpCredential::App(t) => PinnedCred::App {
-                    token: t.token.clone(),
-                    expires_at: t.expires_at,
-                },
+    /// Session pin for this credential; None for Routed credentials, whose
+    /// sessions are pinned by the multi-installation initialize fan-out.
+    fn to_pin(&self, agent_id: Option<&str>) -> Option<SessionPin> {
+        let cred = match self {
+            McpCredential::Pat(i) => PinnedCred::Pat { identity_id: i.id.clone() },
+            McpCredential::App(t) => PinnedCred::App {
+                token: t.token.clone(),
+                expires_at: t.expires_at,
             },
-        }
+            McpCredential::Routed { .. } => return None,
+        };
+        Some(SessionPin { agent_id: agent_id.map(str::to_string), cred })
     }
 }
 
@@ -509,10 +611,14 @@ impl McpCredential {
 ///   its credential must still be valid (expired App token / removed PAT
 ///   identity → session terminated, 404).
 /// - Unknown/expired session ID: 404, so the client re-initializes.
+///
+/// `route_owner` is the repository owner resolved from tools/call arguments
+/// (multi-installation routing key); None routes to the primary installation.
 async fn pick_credential(
     state: &AppState,
     session_id: Option<&str>,
     agent: Option<&crate::config::McpAgentConfig>,
+    route_owner: Option<&str>,
 ) -> Result<McpCredential, StatusCode> {
     let agent_id = agent.map(|a| a.id.as_str());
     if let Some(sid) = session_id {
@@ -553,9 +659,76 @@ async fn pick_credential(
                     );
                     state.mcp_sessions.invalidate(sid).await;
                 }
+                PinnedCred::MultiApp { routes, primary } => {
+                    // Routes are minted together — the session dies as a
+                    // WHOLE at the earliest expiry (documented behavior),
+                    // regardless of which route this call would select.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if routes.values().any(|r| r.expires_at <= now) {
+                        tracing::info!(
+                            "MCP session terminated: a pinned App token expired{}",
+                            session_suffix(Some(sid))
+                        );
+                        state.mcp_sessions.invalidate(sid).await;
+                        return Err(StatusCode::NOT_FOUND);
+                    }
+                    let key = route_owner
+                        .map(|o| o.to_lowercase())
+                        .unwrap_or_else(|| primary.clone());
+                    // Policy (repo allowlist) runs before credential
+                    // resolution, and the pin covers every owner the agent's
+                    // allowlist spans — a missing route means the call slipped
+                    // past policy somehow. Fail closed.
+                    let Some(route) = routes.get(&key) else {
+                        tracing::warn!(
+                            "MCP request rejected: owner {} outside session envelope{}",
+                            key, session_suffix(Some(sid))
+                        );
+                        return Err(StatusCode::FORBIDDEN);
+                    };
+                    return Ok(McpCredential::Routed {
+                        owner: key,
+                        token: route.token.clone(),
+                        upstream_session: route.upstream_session.clone(),
+                    });
+                }
             }
         }
         return Err(StatusCode::NOT_FOUND);
+    }
+    // New session, multi-installation mode: stateless call (initialize is
+    // handled by the fan-out path before credential resolution). Route by
+    // the resolved owner, or the agent's first owner for repo-less methods.
+    if let Some(multi) = &state.multi_app_tokens {
+        // Validation guarantees agents exist in multi mode.
+        let Some(agent) = agent else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let key = match route_owner {
+            Some(o) => o.to_lowercase(),
+            None => match route_owners(agent).into_iter().next() {
+                Some(o) => o,
+                None => return Err(StatusCode::BAD_GATEWAY),
+            },
+        };
+        let Some(provider) = multi.get(&key) else {
+            return Err(StatusCode::FORBIDDEN);
+        };
+        let envelope = scope_envelope_for_owner(agent, &key);
+        return match provider.token_scoped(&envelope).await {
+            Ok(t) => Ok(McpCredential::Routed {
+                owner: key,
+                token: t.token,
+                upstream_session: None,
+            }),
+            Err(e) => {
+                tracing::error!("App token mint failed for owner {}: {}", key, e);
+                Err(StatusCode::BAD_GATEWAY)
+            }
+        };
     }
     // New session: App backend takes precedence when configured. The token
     // is scoped to the agent's repo envelope when possible (exact entries,
@@ -601,6 +774,417 @@ fn scope_envelope(agent: Option<&crate::config::McpAgentConfig>) -> Vec<String> 
         }
     }
     names
+}
+
+/// Owners (lowercase, sorted, deduped) spanned by an agent's repo allowlist.
+/// In multi-installation mode this is the session's credential envelope; the
+/// first owner is the deterministic primary.
+fn route_owners(agent: &crate::config::McpAgentConfig) -> Vec<String> {
+    let mut owners: Vec<String> = agent
+        .repos
+        .iter()
+        .filter_map(|e| e.split_once('/').map(|(o, _)| o.trim().to_lowercase()))
+        .filter(|o| !o.is_empty())
+        .collect();
+    owners.sort();
+    owners.dedup();
+    owners
+}
+
+/// Scoped-mint envelope for ONE owner in multi-installation mode: the exact
+/// repo names the agent may touch under that owner. Any wildcard entry for
+/// the owner falls back to an installation-wide token (proxy-side checks
+/// still apply).
+fn scope_envelope_for_owner(agent: &crate::config::McpAgentConfig, owner: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for entry in &agent.repos {
+        if let Some((o, r)) = entry.split_once('/') {
+            if o.eq_ignore_ascii_case(owner) {
+                if r == "*" || r.is_empty() {
+                    return Vec::new(); // wildcard → installation-wide
+                }
+                names.push(r.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Multi-installation `initialize` fan-out: mint one scoped token per owner
+/// in the agent's envelope, open one upstream session per installation, pin
+/// every route under the primary upstream session ID (which becomes the
+/// downstream session ID), and stream the primary response to the client.
+///
+/// Fail-closed: any mint or upstream initialize failure fails the whole
+/// initialize — the agent learns immediately instead of at its first
+/// tools/call for the broken installation.
+async fn multi_initialize(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    body: Bytes,
+    agent: &crate::config::McpAgentConfig,
+) -> Response {
+    let Some(multi) = &state.multi_app_tokens else {
+        return rpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "multi-installation backend missing",
+        );
+    };
+    let owners = route_owners(agent);
+    let Some(primary_owner) = owners.first().cloned() else {
+        return rpc_error(StatusCode::BAD_GATEWAY, "agent has no routable repository owners");
+    };
+    let upstream = state.config.mcp.upstream();
+
+    let mut routes: std::collections::HashMap<String, AppRoute> =
+        std::collections::HashMap::new();
+    let mut primary_resp: Option<reqwest::Response> = None;
+
+    for owner in &owners {
+        let Some(provider) = multi.get(owner) else {
+            // Startup validation guarantees coverage; fail closed anyway.
+            tracing::error!(
+                "no [[mcp.github_apps]] entry for owner {} — rejecting initialize [agent={}]",
+                owner, agent.id
+            );
+            return abort_multi_initialize(
+                state,
+                &upstream,
+                agent,
+                &routes,
+                rpc_error(
+                    StatusCode::BAD_GATEWAY,
+                    "no GitHub App installation configured for repository owner",
+                ),
+            )
+            .await;
+        };
+        let envelope = scope_envelope_for_owner(agent, owner);
+        let token = match provider.token_scoped(&envelope).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("App token mint failed for owner {}: {}", owner, e);
+                return abort_multi_initialize(
+                    state,
+                    &upstream,
+                    agent,
+                    &routes,
+                    rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable"),
+                )
+                .await;
+            }
+        };
+        let Some(upstream_headers) =
+            build_upstream_headers(headers, &token.token, &[], Some(agent))
+        else {
+            tracing::error!(
+                "credential for owner {} is not a valid header value — check secret source",
+                owner
+            );
+            return abort_multi_initialize(
+                state,
+                &upstream,
+                agent,
+                &routes,
+                rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured"),
+            )
+            .await;
+        };
+        let resp = match state
+            .http
+            .post(&upstream)
+            .headers(upstream_headers)
+            .body(reqwest::Body::from(body.clone()))
+            .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("mcp upstream initialize failed for owner {}: {}", owner, e);
+                return abort_multi_initialize(
+                    state,
+                    &upstream,
+                    agent,
+                    &routes,
+                    rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed"),
+                )
+                .await;
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::error!(
+                "mcp upstream initialize for owner {} returned {}",
+                owner,
+                resp.status()
+            );
+            return abort_multi_initialize(
+                state,
+                &upstream,
+                agent,
+                &routes,
+                rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed"),
+            )
+            .await;
+        }
+        let sid = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        routes.insert(
+            owner.clone(),
+            AppRoute {
+                token: token.token.clone(),
+                expires_at: token.expires_at,
+                upstream_session: sid,
+            },
+        );
+        if *owner == primary_owner {
+            primary_resp = Some(resp);
+        } else {
+            // Secondary responses are consumed internally — and HTTP 2xx is
+            // not sufficient: a JSON-RPC error inside a 200 means this
+            // installation has no usable session. Fail the whole initialize
+            // (fail-closed), because the client only ever sees the primary
+            // response and would otherwise believe every route is healthy.
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            match buffer_body(resp, MAX_BODY_BYTES).await {
+                Ok(BufferedBody::Complete(bytes)) => {
+                    if crate::audit::parse_tool_outcome(content_type.as_deref(), &bytes)
+                        == Some(true)
+                    {
+                        tracing::error!(
+                            "mcp upstream initialize for owner {} returned a JSON-RPC error",
+                            owner
+                        );
+                        return abort_multi_initialize(
+                            state,
+                            &upstream,
+                            agent,
+                            &routes,
+                            rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed"),
+                        )
+                        .await;
+                    }
+                }
+                Ok(BufferedBody::Overflow(_, _)) => {
+                    tracing::error!(
+                        "mcp upstream initialize for owner {} exceeded the buffer cap",
+                        owner
+                    );
+                    return abort_multi_initialize(
+                        state,
+                        &upstream,
+                        agent,
+                        &routes,
+                        rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed"),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "mcp upstream initialize read failed for owner {}: {}",
+                        owner, e
+                    );
+                    return abort_multi_initialize(
+                        state,
+                        &upstream,
+                        agent,
+                        &routes,
+                        rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    let Some(primary) = primary_resp else {
+        return rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed");
+    };
+
+    // Pin the whole envelope under the primary upstream session ID — the
+    // downstream session ID the client presents from now on.
+    if let Some(dsid) = routes
+        .get(&primary_owner)
+        .and_then(|r| r.upstream_session.clone())
+    {
+        tracing::info!(
+            "MCP session pinned to {} installation route(s): {} [agent={}]{}",
+            routes.len(),
+            owners.join(","),
+            agent.id,
+            session_suffix(Some(dsid.as_str()))
+        );
+        state
+            .mcp_sessions
+            .insert(
+                dsid,
+                SessionPin {
+                    agent_id: Some(agent.id.clone()),
+                    cred: PinnedCred::MultiApp {
+                        routes: routes.clone(),
+                        primary: primary_owner.clone(),
+                    },
+                },
+            )
+            .await;
+    } else {
+        tracing::warn!(
+            "upstream initialize returned no session id — multi-installation session not pinned [agent={}]",
+            agent.id
+        );
+    }
+
+    let status =
+        StatusCode::from_u16(primary.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for name in RESP_HEADERS {
+        if let Some(v) = primary.headers().get(*name) {
+            builder = builder.header(*name, v.clone());
+        }
+    }
+    builder
+        .body(Body::from_stream(primary.bytes_stream()))
+        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
+}
+
+/// Abort a partially fanned-out initialize: best-effort DELETE of every
+/// upstream session already opened, so a failed initialize does not leave
+/// orphaned upstream sessions alive until server-side TTL. The provided
+/// error response is returned unchanged — cleanup never masks the failure.
+async fn abort_multi_initialize(
+    state: &Arc<AppState>,
+    upstream: &str,
+    agent: &crate::config::McpAgentConfig,
+    routes: &std::collections::HashMap<String, AppRoute>,
+    error_resp: Response,
+) -> Response {
+    for (owner, route) in routes {
+        let Some(us) = &route.upstream_session else { continue };
+        let Some(mut h) = build_upstream_headers(&HeaderMap::new(), &route.token, &[], Some(agent))
+        else {
+            continue;
+        };
+        let Ok(v) = us.parse() else { continue };
+        h.insert("mcp-session-id", v);
+        match state
+            .http
+            .delete(upstream)
+            .headers(h)
+            .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS))
+            .send()
+            .await
+        {
+            Ok(_) => tracing::info!(
+                "aborted initialize: cleaned up upstream session for owner {} [agent={}]",
+                owner, agent.id
+            ),
+            Err(e) => tracing::warn!(
+                "aborted initialize: failed to clean up upstream session for owner {}: {}",
+                owner, e
+            ),
+        }
+    }
+    error_resp
+}
+
+/// Fan a session-wide frame (DELETE, `notifications/*`) out to every route
+/// of a multi-installation session, so each upstream session observes the
+/// same lifecycle the client drives on the single downstream session.
+/// Returns None when the session is not a multi-installation pin — the
+/// caller falls through to the normal path.
+async fn multi_fanout(
+    state: &Arc<AppState>,
+    method: &Method,
+    headers: &HeaderMap,
+    body: &Bytes,
+    downstream_sid: &str,
+    agent: Option<&crate::config::McpAgentConfig>,
+) -> Option<Response> {
+    let pin = state.mcp_sessions.get(downstream_sid).await?;
+    if pin.agent_id.as_deref() != agent.map(|a| a.id.as_str()) {
+        tracing::warn!(
+            "MCP session binding violation: session initialized by {:?}, presented by {:?}{}",
+            pin.agent_id,
+            agent.map(|a| a.id.as_str()),
+            session_suffix(Some(downstream_sid))
+        );
+        return Some(rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent"));
+    }
+    let PinnedCred::MultiApp { routes, primary } = &pin.cred else {
+        return None;
+    };
+
+    let upstream = state.config.mcp.upstream();
+    // Primary first, then the rest — deterministic, mirrors initialize.
+    let mut ordered: Vec<(&String, &AppRoute)> = routes.iter().collect();
+    ordered.sort_by_key(|(o, _)| (*o != primary, (*o).clone()));
+
+    let mut primary_result: Option<Response> = None;
+    for (owner, route) in ordered {
+        let Some(us) = &route.upstream_session else { continue };
+        let Some(mut h) = build_upstream_headers(headers, &route.token, &[], agent) else {
+            tracing::error!("credential for owner {} is not a valid header value", owner);
+            continue;
+        };
+        let Ok(v) = us.parse() else { continue };
+        h.insert("mcp-session-id", v);
+        let req = if *method == Method::POST {
+            state
+                .http
+                .post(&upstream)
+                .body(reqwest::Body::from(body.clone()))
+                .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+        } else if *method == Method::DELETE {
+            state
+                .http
+                .delete(&upstream)
+                .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS))
+        } else {
+            return Some(rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"));
+        };
+        match req.headers(h).send().await {
+            Ok(resp) => {
+                if owner == primary && primary_result.is_none() {
+                    let status = StatusCode::from_u16(resp.status().as_u16())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    let mut builder = Response::builder().status(status);
+                    for name in RESP_HEADERS {
+                        if let Some(v) = resp.headers().get(*name) {
+                            if *name == "mcp-session-id" {
+                                // Never leak an upstream session ID downstream
+                                builder = builder.header(*name, downstream_sid);
+                                continue;
+                            }
+                            builder = builder.header(*name, v.clone());
+                        }
+                    }
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    primary_result = Some(builder.body(Body::from(bytes)).unwrap_or_else(
+                        |_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"),
+                    ));
+                } else {
+                    let _ = resp.bytes().await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("mcp multi fan-out to owner {} failed: {}", owner, e);
+            }
+        }
+    }
+
+    // Session termination: drop the whole multi-route pin
+    if *method == Method::DELETE {
+        state.mcp_sessions.invalidate(downstream_sid).await;
+    }
+
+    Some(primary_result.unwrap_or_else(|| rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed")))
 }
 
 /// RAII in-flight counter for per-agent write concurrency caps.
@@ -816,7 +1400,7 @@ mod tests {
     fn cred_pat_id(c: &McpCredential) -> &str {
         match c {
             McpCredential::Pat(i) => &i.id,
-            McpCredential::App(_) => panic!("expected PAT credential"),
+            _ => panic!("expected PAT credential"),
         }
     }
 
@@ -854,6 +1438,7 @@ mod tests {
                     max_inflight_writes: 4,
                     agents,
                     github_app: None,
+                    github_apps: Vec::new(),
                     audit: None,
                 },
             },
@@ -861,6 +1446,7 @@ mod tests {
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: None,
+            multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
@@ -930,7 +1516,7 @@ mod tests {
         let state = test_state(&["alice", "bob"]);
         state.mcp_sessions.insert("sess-1".to_string(), pin("bob", None)).await;
 
-        let cred = pick_credential(&state, Some("sess-1"), None).await.unwrap();
+        let cred = pick_credential(&state, Some("sess-1"), None, None).await.unwrap();
         assert_eq!(cred_pat_id(&cred), "bob");
         assert_eq!(cred.token(), "token-bob");
     }
@@ -938,7 +1524,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_session_returns_404() {
         let state = test_state(&["alice"]);
-        match pick_credential(&state, Some("never-seen"), None).await {
+        match pick_credential(&state, Some("never-seen"), None, None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("unknown session must not resolve an identity"),
         }
@@ -947,14 +1533,14 @@ mod tests {
     #[tokio::test]
     async fn test_no_session_selects_from_pool() {
         let state = test_state(&["alice"]);
-        let cred = pick_credential(&state, None, None).await.unwrap();
+        let cred = pick_credential(&state, None, None, None).await.unwrap();
         assert_eq!(cred_pat_id(&cred), "alice");
     }
 
     #[tokio::test]
     async fn test_no_identities_returns_503() {
         let state = test_state(&[]);
-        match pick_credential(&state, None, None).await {
+        match pick_credential(&state, None, None, None).await {
             Err(code) => assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE),
             Ok(_) => panic!("expected SERVICE_UNAVAILABLE with empty pool"),
         }
@@ -966,7 +1552,7 @@ mod tests {
         // treated as terminated (404), pin removed — never identity rotation.
         let state = test_state(&["alice"]);
         state.mcp_sessions.insert("sess-x".to_string(), pin("gone", None)).await;
-        match pick_credential(&state, Some("sess-x"), None).await {
+        match pick_credential(&state, Some("sess-x"), None, None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("stale pin must not resolve an identity"),
         }
@@ -1734,6 +2320,7 @@ mod tests {
                     max_inflight_writes: 4,
                     agents: vec![],
                     github_app: None, // provider injected directly below
+                    github_apps: Vec::new(),
                     audit: None,
                 },
             },
@@ -1741,6 +2328,7 @@ mod tests {
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: Some(provider),
+            multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
@@ -1861,6 +2449,7 @@ mod tests {
                     max_inflight_writes: 4,
                     agents: vec![],
                     github_app: None,
+                    github_apps: Vec::new(),
                     audit: Some(config::AuditConfig { path: "unused".into(), max_result_bytes: cap }),
                 },
             },
@@ -1868,6 +2457,7 @@ mod tests {
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: None,
+            multi_app_tokens: None,
             audit: Some(sink),
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
@@ -2049,6 +2639,7 @@ mod tests {
                     max_inflight_writes: max_inflight,
                     agents,
                     github_app: None, // PAT creds acceptable for unit tests
+                    github_apps: Vec::new(),
                     audit: Some(config::AuditConfig { path: "unused".into(), max_result_bytes: 1024 * 1024 }),
                 },
             },
@@ -2056,6 +2647,7 @@ mod tests {
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
             app_tokens: None,
+            multi_app_tokens: None,
             audit: Some(sink),
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
@@ -2168,6 +2760,580 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- Multi-installation GitHub App routing (one key, many orgs) ----
+
+    /// Mock GitHub API minting distinguishable tokens per installation.
+    async fn spawn_mock_github_multi() -> String {
+        async fn mint(token: &'static str) -> axum::Json<serde_json::Value> {
+            let exp = time::OffsetDateTime::from_unix_timestamp((now() + 3600) as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            axum::Json(serde_json::json!({"token": token, "expires_at": exp}))
+        }
+        let app = axum::Router::new()
+            .route(
+                "/app/installations/41/access_tokens",
+                axum::routing::post(|| mint("ghs_openabdev")),
+            )
+            .route(
+                "/app/installations/42/access_tokens",
+                axum::routing::post(|| mint("ghs_oablab")),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    /// Upstream mock whose initialize responses derive the session ID from
+    /// the presented bearer token — distinct installations get distinct
+    /// upstream sessions. Non-initialize responses echo the session they
+    /// were called with (to exercise the downstream session ID override).
+    async fn mock_upstream_handler_multi(
+        State(captured): State<CapturedLog>,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let body_str = String::from_utf8_lossy(&body).to_string();
+        let auth = get("authorization");
+        let session = get("mcp-session-id");
+        captured.lock().unwrap().push(Captured {
+            method: method.to_string(),
+            auth: auth.clone(),
+            toolsets: get("x-mcp-toolsets"),
+            tools_hdr: get("x-mcp-tools"),
+            ghpool_key: get("x-ghpool-key"),
+            session: session.clone(),
+            body: body_str.clone(),
+        });
+        if body_str.contains("fail_secondary")
+            && auth.as_deref() == Some("Bearer ghs_openabdev")
+        {
+            // JSON-RPC error INSIDE an HTTP 200 — a session id is present
+            // but the initialization failed at the protocol level.
+            return Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .header("mcp-session-id", "sess-ghs_openabdev")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"boom"}}"#,
+                ))
+                .unwrap();
+        }
+        if body_str.contains("\"initialize\"") {
+            let token = auth
+                .as_deref()
+                .unwrap_or("")
+                .trim_start_matches("Bearer ")
+                .to_string();
+            return Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .header("mcp-session-id", format!("sess-{}", token))
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#))
+                .unwrap();
+        }
+        let mut builder = Response::builder()
+            .status(200)
+            .header("content-type", "application/json");
+        if let Some(sid) = session {
+            builder = builder.header("mcp-session-id", sid);
+        }
+        builder
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#))
+            .unwrap()
+    }
+
+    async fn spawn_mock_upstream_multi() -> (String, CapturedLog) {
+        let captured: CapturedLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/", axum::routing::any(mock_upstream_handler_multi))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), captured)
+    }
+
+    /// Multi-installation state: agent b0 spans openabdev (installation 41)
+    /// and oablab (installation 42). Sorted owners make oablab the primary.
+    async fn test_state_multi(
+        upstream: &str,
+        enable_writes: bool,
+        sink: Option<crate::audit::AuditSink>,
+    ) -> Arc<AppState> {
+        let gh = spawn_mock_github_multi().await;
+        let entries = vec![
+            config::GithubAppsEntry {
+                app_id: "111".into(),
+                private_key: crate::app_token::tests::TEST_RSA_PEM.into(),
+                installation_id: Some(41),
+                owner: "openabdev".into(),
+            },
+            config::GithubAppsEntry {
+                app_id: "222".into(),
+                private_key: crate::app_token::tests::TEST_RSA_PEM.into(),
+                installation_id: Some(42),
+                owner: "oablab".into(),
+            },
+        ];
+        let multi = crate::app_token::MultiAppTokenProvider::new(&entries, gh).unwrap();
+        let agents = vec![
+            agent_with_repos(
+                "b0",
+                "key-b0",
+                &["issue_read", "list_issues", "create_issue", "add_issue_comment"],
+                &["openabdev/openab", "oablab/chi"],
+            ),
+            // Second agent with a valid key of its own — for session
+            // binding tests (must never be able to ride b0's session).
+            agent_with_repos(
+                "intruder",
+                "key-intruder",
+                &["issue_read"],
+                &["openabdev/openab"],
+            ),
+        ];
+        let cache_config = config::CacheConfig::default();
+        let has_sink = sink.is_some();
+        Arc::new(AppState {
+            pool: pool::PatPool::new(&[]),
+            cache: cache::Cache::new(&cache_config),
+            config: config::Config {
+                port: 8080,
+                identities: vec![],
+                allowed_owners: vec!["openabdev".to_string(), "oablab".to_string()],
+                cache: cache_config,
+                mcp: config::McpConfig {
+                    enabled: true,
+                    enable_writes,
+                    upstream: Some(upstream.to_string()),
+                    toolsets: vec![],
+                    session_ttl_secs: 3600,
+                    max_inflight_writes: 4,
+                    agents,
+                    github_app: None,
+                    github_apps: entries,
+                    audit: has_sink.then(|| config::AuditConfig {
+                        path: "unused".into(),
+                        max_result_bytes: 1024 * 1024,
+                    }),
+                },
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: None,
+            multi_app_tokens: Some(multi),
+            audit: sink,
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        })
+    }
+
+    const MULTI_INIT: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#;
+
+    #[test]
+    fn test_route_owners_and_owner_envelope() {
+        let a = agent_with_repos(
+            "a", "k", &[],
+            &["openabdev/openab", "OABLAB/chi", "openabdev/ghpool"],
+        );
+        assert_eq!(route_owners(&a), vec!["oablab", "openabdev"]);
+        assert_eq!(scope_envelope_for_owner(&a, "openabdev"), vec!["openab", "ghpool"]);
+        assert_eq!(scope_envelope_for_owner(&a, "oablab"), vec!["chi"]);
+        assert!(scope_envelope_for_owner(&a, "other").is_empty());
+        // wildcard for the owner → installation-wide
+        let w = agent_with_repos("a", "k", &[], &["openabdev/*", "openabdev/openab"]);
+        assert!(scope_envelope_for_owner(&w, "openabdev").is_empty());
+        // other owners unaffected by that wildcard
+        let m = agent_with_repos("a", "k", &[], &["openabdev/*", "oablab/chi"]);
+        assert_eq!(scope_envelope_for_owner(&m, "oablab"), vec!["chi"]);
+    }
+
+    #[tokio::test]
+    async fn test_multi_initialize_fans_out_and_pins_routes() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Primary is the first sorted owner (oablab) — its upstream session
+        // ID is the downstream session ID.
+        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+
+        // One upstream initialize per installation, each with its own token
+        {
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            let auths: Vec<String> =
+                reqs.iter().map(|r| r.auth.clone().unwrap_or_default()).collect();
+            assert!(auths.contains(&"Bearer ghs_oablab".to_string()));
+            assert!(auths.contains(&"Bearer ghs_openabdev".to_string()));
+        }
+
+        // The pin covers both routes with distinct upstream sessions
+        let pin = state.mcp_sessions.get("sess-ghs_oablab").await.unwrap();
+        assert_eq!(pin.agent_id.as_deref(), Some("b0"));
+        match pin.cred {
+            PinnedCred::MultiApp { routes, primary } => {
+                assert_eq!(primary, "oablab");
+                assert_eq!(routes.len(), 2);
+                assert_eq!(routes["oablab"].token, "ghs_oablab");
+                assert_eq!(
+                    routes["oablab"].upstream_session.as_deref(),
+                    Some("sess-ghs_oablab")
+                );
+                assert_eq!(routes["openabdev"].token, "ghs_openabdev");
+                assert_eq!(
+                    routes["openabdev"].upstream_session.as_deref(),
+                    Some("sess-ghs_openabdev")
+                );
+            }
+            other => panic!("expected MultiApp pin, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multi_tools_call_routes_by_owner() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .await
+            .unwrap();
+        captured.lock().unwrap().clear();
+
+        // openabdev call → openabdev token, on openabdev's OWN upstream
+        // session; the client still sees the downstream session ID.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
+                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+
+        // oablab call → oablab token on the primary upstream session
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"oablab","repo":"chi","issue_number":2}}}"#,
+                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].auth.as_deref(), Some("Bearer ghs_openabdev"));
+        assert_eq!(reqs[0].session.as_deref(), Some("sess-ghs_openabdev"));
+        assert_eq!(reqs[1].auth.as_deref(), Some("Bearer ghs_oablab"));
+        assert_eq!(reqs[1].session.as_deref(), Some("sess-ghs_oablab"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_uncovered_owner_denied_by_policy() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .await
+            .unwrap();
+        captured.lock().unwrap().clear();
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"evil","repo":"repo","issue_number":1}}}"#,
+                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_multi_stateless_call_routes_without_session() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
+                &[("x-ghpool-key", "key-b0")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].auth.as_deref(), Some("Bearer ghs_openabdev"));
+        // stateless: no session forwarded upstream
+        assert!(reqs[0].session.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_multi_expired_route_terminates_session() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "openabdev".to_string(),
+            AppRoute {
+                token: "ghs_expired".into(),
+                expires_at: now() - 10,
+                upstream_session: Some("u1".into()),
+            },
+        );
+        routes.insert(
+            "oablab".to_string(),
+            AppRoute {
+                token: "ghs_live".into(),
+                expires_at: now() + 3600,
+                upstream_session: Some("u2".into()),
+            },
+        );
+        state
+            .mcp_sessions
+            .insert(
+                "dsid".to_string(),
+                SessionPin {
+                    agent_id: Some("b0".into()),
+                    cred: PinnedCred::MultiApp { routes, primary: "oablab".into() },
+                },
+            )
+            .await;
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                // Call the LIVE route (oablab): routes are minted together,
+                // so ANY expired route terminates the session as a whole.
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"oablab","repo":"chi","issue_number":1}}}"#,
+                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "dsid")],
+            ))
+            .await
+            .unwrap();
+        // Terminated per MCP spec: 404 → client re-initializes (fresh mints)
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(state.mcp_sessions.get("dsid").await.is_none());
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_multi_initialize_fails_closed_on_secondary_jsonrpc_error() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        // The mock returns a JSON-RPC error (inside HTTP 200) for the
+        // openabdev (secondary) installation when the frame is tagged.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"tag":"fail_secondary"}}"#,
+                &[("x-ghpool-key", "key-b0")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // No session pinned
+        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_none());
+        // Partial-initialize cleanup: every upstream session opened before
+        // the failure was DELETEd with its own credential — no orphans.
+        let reqs = captured.lock().unwrap();
+        let posts: Vec<&Captured> = reqs.iter().filter(|r| r.method == "POST").collect();
+        assert_eq!(posts.len(), 2);
+        let deletes: Vec<(String, String)> = reqs
+            .iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| {
+                (r.auth.clone().unwrap_or_default(), r.session.clone().unwrap_or_default())
+            })
+            .collect();
+        assert!(
+            deletes.contains(&("Bearer ghs_oablab".into(), "sess-ghs_oablab".into())),
+            "primary upstream session must be cleaned up, got {:?}",
+            deletes
+        );
+        assert!(
+            deletes.contains(&("Bearer ghs_openabdev".into(), "sess-ghs_openabdev".into())),
+            "failed secondary's session must be cleaned up too, got {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_notifications_fan_out_to_all_routes() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .await
+            .unwrap();
+        captured.lock().unwrap().clear();
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Never leak an upstream session ID downstream
+        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+
+        // Every installation's upstream session received the notification
+        // with its own credential and its own session ID
+        {
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            assert!(reqs.iter().all(|r| r.body.contains("notifications/initialized")));
+            let pairs: Vec<(String, String)> = reqs
+                .iter()
+                .map(|r| {
+                    (r.auth.clone().unwrap_or_default(), r.session.clone().unwrap_or_default())
+                })
+                .collect();
+            assert!(pairs.contains(&("Bearer ghs_oablab".into(), "sess-ghs_oablab".into())));
+            assert!(pairs.contains(&("Bearer ghs_openabdev".into(), "sess-ghs_openabdev".into())));
+        }
+
+        // Notification fan-out does not terminate the session
+        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_multi_session_binding_rejects_other_agent() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .await
+            .unwrap();
+        captured.lock().unwrap().clear();
+
+        // A different agent with a VALID key of its own, presenting b0's
+        // session on tools/call (routed path) → 403, upstream untouched
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
+                &[("x-ghpool-key", "key-intruder"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured.lock().unwrap().is_empty());
+
+        // Same for DELETE (fan-out path) → 403, pin survives
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header("x-ghpool-key", "key-intruder")
+            .header("mcp-session-id", "sess-ghs_oablab")
+            .body(Body::empty())
+            .unwrap();
+        let resp = mcp_app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_some());
+
+        // The rightful owner still works
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"oablab","repo":"chi","issue_number":2}}}"#,
+                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_multi_delete_fans_out_to_all_routes() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .await
+            .unwrap();
+        captured.lock().unwrap().clear();
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header("x-ghpool-key", "key-b0")
+            .header("mcp-session-id", "sess-ghs_oablab")
+            .body(Body::empty())
+            .unwrap();
+        let resp = mcp_app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Every installation's upstream session was terminated, each with
+        // its own credential
+        {
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            assert!(reqs.iter().all(|r| r.method == "DELETE"));
+            let pairs: Vec<(String, String)> = reqs
+                .iter()
+                .map(|r| {
+                    (r.auth.clone().unwrap_or_default(), r.session.clone().unwrap_or_default())
+                })
+                .collect();
+            assert!(pairs.contains(&("Bearer ghs_oablab".into(), "sess-ghs_oablab".into())));
+            assert!(pairs.contains(&("Bearer ghs_openabdev".into(), "sess-ghs_openabdev".into())));
+        }
+
+        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_multi_write_audited_with_installation_label() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let path = audit_tmp("multi-write");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_multi(&url, true, Some(sink)).await;
+        mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .await
+            .unwrap();
+        captured.lock().unwrap().clear();
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"openab","title":"t"}}}"#,
+                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Forwarded with the openabdev installation credential
+        {
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].auth.as_deref(), Some("Bearer ghs_openabdev"));
+        }
+
+        // Audit attributes the write to the exact installation
+        let records = read_audit(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["phase"], "request");
+        assert_eq!(records[0]["agent"], "b0");
+        assert_eq!(records[0]["cred"], "github-app:openabdev");
+        assert_eq!(records[0]["repo"], "openabdev/openab");
+        assert_eq!(records[1]["phase"], "result");
+        assert_eq!(records[1]["tool_error"], false);
         std::fs::remove_file(&path).ok();
     }
 }
