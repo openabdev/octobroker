@@ -181,6 +181,22 @@ pub async fn mcp_proxy(
         }
     }
 
+    // Local ghpool-owned tools are writes even when the upstream policy block
+    // is bypassed (for example, in no-agent/network-trust mode). Keep the
+    // local mutation path fail-closed and before credential resolution.
+    if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL)
+        && (agent.is_none() || !state.config.mcp.enable_writes)
+    {
+        tracing::warn!(
+            "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
+            MINIMIZE_COMMENT_TOOL
+        );
+        return rpc_error(
+            StatusCode::FORBIDDEN,
+            "local write tools require an authenticated write-enabled agent",
+        );
+    }
+
     // Multi-installation mode: `initialize` fans out to one upstream session
     // per owner in the agent's envelope; DELETE and notifications fan out to
     // every pinned route. Repo-less agents skip fan-out entirely — they keep
@@ -2724,6 +2740,23 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_phase1_mode_denies_local_minimize_tool() {
+        // No agents → local write tools must not bypass the write gate and
+        // reach GitHub through the legacy PAT-backed path.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ghpool_review_minimize_comment","arguments":{"owner":"openabdev","repo":"ghpool","node_id":"MDU6SXNzdWUx","classifier":"OUTDATED"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
     // ---- 2b-3: GitHub App credential backend ----
