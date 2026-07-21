@@ -54,9 +54,10 @@ pub struct AppTokenProvider {
     cached: Mutex<HashMap<String, AppToken>>,
     /// Per-key singleflight locks: concurrent misses for the SAME cache key
     /// wait for one mint; distinct keys (different repos or purposes) mint
-    /// in parallel so one slow mint cannot stall unrelated issuance. The
-    /// map is bounded by the distinct (purpose, envelope) combinations in
-    /// use.
+    /// in parallel so one slow mint cannot stall unrelated issuance.
+    /// Entries are evicted when the mint completes, so the map is bounded
+    /// by in-flight mints — request-supplied repo names (e.g. failed mints
+    /// under a wildcard allowlist) cannot accumulate.
     mint_locks: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Owner verified from GitHub's installation API for an explicit ID,
     /// with the verification time — re-checked after VERIFY_TTL. The
@@ -169,12 +170,22 @@ impl AppTokenProvider {
         let _mint_guard = key_lock.lock().await;
         if let Some(t) = self.cached.lock().unwrap().get(&key) {
             if t.expires_at > unix_now() + REFRESH_MARGIN.as_secs() {
+                // fulfilled by the leader while we waited — evict our entry
+                // too in case the leader's eviction raced our map insert
+                self.mint_locks.lock().unwrap().remove(&key);
                 return Ok(t.clone());
             }
         }
-        let fresh = self.mint(&envelope, permissions.as_ref()).await?;
-        self.cached.lock().unwrap().insert(key, fresh.clone());
-        Ok(fresh)
+        let result = self.mint(&envelope, permissions.as_ref()).await;
+        if let Ok(fresh) = &result {
+            self.cached.lock().unwrap().insert(key.clone(), fresh.clone());
+        }
+        // Evict the singleflight entry whether the mint succeeded or failed:
+        // waiters already holding this Arc still serialize behind it and
+        // re-check the cache; the next fresh miss creates a new lock. This
+        // bounds the map to in-flight mints instead of every key ever seen.
+        self.mint_locks.lock().unwrap().remove(&key);
+        result
     }
 
     async fn mint(
@@ -732,5 +743,58 @@ pub(crate) mod tests {
         let slow = slow.await.unwrap().unwrap();
         assert_eq!(slow.token, "ghs_slowrepo");
         assert!(start.elapsed() >= std::time::Duration::from_millis(500));
+        // singleflight entries are evicted once mints complete — the map
+        // must not grow with every key ever requested
+        assert!(p.mint_locks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mint_locks_evicted_after_success_and_failure() {
+        use axum::{routing::post, Json, Router};
+
+        // "badrepo*" fails to mint; "goodrepo" succeeds.
+        async fn mint(Json(body): Json<serde_json::Value>) -> axum::response::Response {
+            let repos = body["repositories"].as_array().cloned().unwrap_or_default();
+            if repos.iter().any(|r| r.as_str().unwrap().starts_with("badrepo")) {
+                return axum::response::Response::builder()
+                    .status(422)
+                    .body(axum::body::Body::from("{\"message\":\"not found\"}"))
+                    .unwrap();
+            }
+            let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"token": "ghs_good", "expires_at": exp}).to_string(),
+                ))
+                .unwrap()
+        }
+        let app = Router::new().route("/app/installations/9/access_tokens", post(mint));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(9),
+            None,
+            format!("http://{}", addr),
+        )
+        .unwrap();
+
+        p.token_git("goodrepo").await.unwrap();
+        assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on success");
+
+        // A wildcard-allowlisted agent can request arbitrary names; failed
+        // mints must not leave lock entries behind (unbounded growth).
+        for i in 0..5 {
+            p.token_git(&format!("badrepo{}", i)).await.unwrap_err();
+        }
+        assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on failure");
     }
 }
