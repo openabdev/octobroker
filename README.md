@@ -433,8 +433,15 @@ tools/call {owner: "oablab", …}    → session B (oablab token)
   invariant per installation.
 - **One downstream session** — the client sees a single session ID; ghpool
   maps it to the per-installation upstream sessions. `DELETE` and
-  `notifications/*` fan out to every route. When a pinned token expires the
-  session gets 404 and the client re-initializes (fresh tokens all around).
+  `notifications/*` fan out to every route (best-effort for secondaries).
+  When a pinned token expires the session gets 404 and the client
+  re-initializes (fresh tokens all around).
+- **Primary route** — the alphabetically first owner in the agent's `repos`
+  allowlist. Its upstream session ID doubles as the downstream session ID
+  and serves non-repo traffic (`tools/list`, GET streams).
+- **Grant identical App permissions to every installation** — `tools/list`
+  is served by the primary installation, so a permission mismatch would
+  advertise tools that fail with a permission error on the other org.
 - **Startup validation** — duplicate owners, agents without `repos`, and repo
   owners with no matching installation are all configuration errors.
 - **Audit attribution** — write records carry the exact installation:
