@@ -428,7 +428,8 @@ tools/call {owner: "oablab", …}    → session B (oablab token)
   allowlist are denied before any credential is touched.
 - **Eager fan-out at `initialize`** — one repo-scoped token is minted and one
   upstream session opened per owner in the agent's allowlist, fail-closed: if
-  any installation can't mint or initialize, the whole `initialize` fails.
+  any installation can't mint or initialize, the whole `initialize` fails and
+  any upstream sessions already opened are cleaned up (best-effort DELETE).
   Tokens are never mixed within one upstream session, preserving the pinning
   invariant per installation.
 - **One downstream session** — the client sees a single session ID; ghpool
