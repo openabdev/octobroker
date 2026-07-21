@@ -93,6 +93,12 @@ pub struct McpConfig {
     /// path injects short-lived installation tokens instead of pooled PATs.
     #[serde(default)]
     pub github_app: Option<GithubAppConfig>,
+    /// Multi-app mode: one App installation per repository owner. When
+    /// configured, tool calls are routed to the matching installation based
+    /// on the resolved owner from tool arguments. Mutually exclusive with
+    /// `github_app` (validated at startup).
+    #[serde(default)]
+    pub github_apps: Vec<GithubAppsEntry>,
     /// Durable audit trail for write-classified tools/call (Phase 2b).
     /// Required before writes can be enabled (2b-5): a write call whose
     /// pre-flight audit record cannot be persisted is rejected (fail-closed).
@@ -133,6 +139,21 @@ pub struct GithubAppConfig {
     pub owner: Option<String>,
 }
 
+/// Multi-app mode: one GitHub App installation per repository owner.
+/// Each entry maps a normalized owner to its own App credential, enabling
+/// a single authenticated MCP agent to operate across organizations via
+/// owner-based routing. The owner is resolved from tool call arguments
+/// (never agent-controlled installation selection).
+#[derive(Clone, Deserialize)]
+pub struct GithubAppsEntry {
+    pub app_id: String,
+    pub private_key: String,
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+    /// Required in multi-app mode: the owner this entry handles.
+    pub owner: String,
+}
+
 /// One authenticated MCP agent: key(s) → identity → tool allowlist.
 #[derive(Clone, Deserialize)]
 pub struct McpAgentConfig {
@@ -170,6 +191,7 @@ impl Default for McpConfig {
             max_inflight_writes: default_mcp_max_inflight_writes(),
             agents: Vec::new(),
             github_app: None,
+            github_apps: Vec::new(),
             audit: None,
         }
     }
@@ -195,11 +217,64 @@ impl McpConfig {
             if self.agents.is_empty() {
                 return Err("enable_writes requires [[mcp.agents]] — writes are never available in network-trust mode".into());
             }
-            if self.github_app.is_none() {
-                return Err("enable_writes requires [mcp.github_app] — writes never run on pooled PATs".into());
+            if self.github_app.is_none() && self.github_apps.is_empty() {
+                return Err("enable_writes requires [mcp.github_app] or [[mcp.github_apps]] — writes never run on pooled PATs".into());
             }
             if self.audit.is_none() {
                 return Err("enable_writes requires [mcp.audit] — writes are fail-closed audited".into());
+            }
+        }
+        // Mutual exclusion: singular and plural forms cannot coexist
+        if self.github_app.is_some() && !self.github_apps.is_empty() {
+            return Err("[mcp.github_app] and [[mcp.github_apps]] are mutually exclusive — use one or the other".into());
+        }
+        // Multi-app validation
+        if !self.github_apps.is_empty() {
+            let mut seen_owners: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for entry in &self.github_apps {
+                let normalized = entry.owner.trim().to_lowercase();
+                if normalized.is_empty() {
+                    return Err("[[mcp.github_apps]] entry has empty owner".into());
+                }
+                if !seen_owners.insert(normalized.clone()) {
+                    return Err(format!(
+                        "[[mcp.github_apps]] duplicate owner '{}' — each owner must map to exactly one App",
+                        entry.owner
+                    ));
+                }
+            }
+            // Multi-installation routing derives each session's credential
+            // envelope from the agent's repo allowlist, so it needs
+            // authenticated agents with fully covered, well-formed repos —
+            // for reads and writes alike.
+            if self.agents.is_empty() {
+                return Err("[[mcp.github_apps]] requires [[mcp.agents]] — multi-installation routing is not available in network-trust mode".into());
+            }
+            for agent in &self.agents {
+                if agent.repos.is_empty() {
+                    return Err(format!(
+                        "mcp agent '{}' requires a non-empty `repos` allowlist in multi-installation mode — the repo owners select the installation",
+                        agent.id
+                    ));
+                }
+                for repo_entry in &agent.repos {
+                    let owner = match repo_entry.split_once('/') {
+                        Some((owner, _)) if !owner.trim().is_empty() => owner,
+                        _ => {
+                            return Err(format!(
+                                "mcp agent '{}' repo entry '{}' is malformed — expected owner/repo or owner/*",
+                                agent.id, repo_entry
+                            ));
+                        }
+                    };
+                    let normalized = owner.trim().to_lowercase();
+                    if !seen_owners.contains(&normalized) {
+                        return Err(format!(
+                            "mcp agent '{}' authorizes repo owner '{}' but no [[mcp.github_apps]] entry covers it — agents cannot authorize a repo owner without a matching installation",
+                            agent.id, owner
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -331,6 +406,11 @@ impl Config {
             let pem = resolve_secret(&app.private_key).await;
             // Env vars / JSON secrets often carry the PEM with literal \n
             app.private_key = pem.replace("\\n", "\n");
+        }
+        for entry in &mut mcp.github_apps {
+            let pem = resolve_secret(&entry.private_key).await;
+            entry.private_key = pem.replace("\\n", "\n");
+            entry.owner = entry.owner.trim().to_lowercase();
         }
         Config {
             port: raw.port,
@@ -502,5 +582,93 @@ mod tests {
         assert_eq!(m.upstream(), "https://api.githubcopilot.com/mcp/");
         let m = McpConfig { upstream: Some("http://x/".into()), enable_writes: true, ..Default::default() };
         assert_eq!(m.upstream(), "http://x/");
+    }
+
+    #[test]
+    fn test_mcp_validate_multi_app() {
+        fn entry(owner: &str) -> GithubAppsEntry {
+            GithubAppsEntry {
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: owner.into(),
+            }
+        }
+        fn multi_agent(repos: &[&str]) -> McpAgentConfig {
+            McpAgentConfig {
+                id: "b0".into(),
+                key: None,
+                keys: vec!["k".into()],
+                tools: vec![],
+                repos: repos.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        // mutually exclusive with the singular form
+        let m = McpConfig {
+            github_app: Some(GithubAppConfig {
+                app_id: "1".into(), private_key: "pem".into(),
+                installation_id: Some(1), owner: None,
+            }),
+            github_apps: vec![entry("openabdev")],
+            agents: vec![multi_agent(&["openabdev/x"])],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("mutually exclusive"));
+
+        // duplicate owners (case-insensitive) rejected
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev"), entry("OpenABdev")],
+            agents: vec![multi_agent(&["openabdev/x"])],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("duplicate owner"));
+
+        // empty owner rejected
+        let m = McpConfig {
+            github_apps: vec![entry("  ")],
+            agents: vec![multi_agent(&["openabdev/x"])],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("empty owner"));
+
+        // agents required in multi mode (routing needs an envelope)
+        let m = McpConfig { github_apps: vec![entry("openabdev")], ..Default::default() };
+        assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
+
+        // non-empty repos required per agent
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev")],
+            agents: vec![multi_agent(&[])],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("non-empty `repos`"));
+
+        // every repo owner must have a matching installation
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev")],
+            agents: vec![multi_agent(&["openabdev/x", "oablab/chi"])],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("no [[mcp.github_apps]] entry"));
+
+        // malformed repo entry rejected
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev")],
+            agents: vec![multi_agent(&["justanowner"])],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("malformed"));
+
+        // valid multi config satisfies the write gate too
+        let m = McpConfig {
+            enabled: true,
+            enable_writes: true,
+            github_apps: vec![entry("openabdev"), entry("oablab")],
+            agents: vec![multi_agent(&["openabdev/openab", "oablab/chi"])],
+            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
     }
 }

@@ -80,6 +80,28 @@ enabled = false
 # owner = "openabdev"          # installation discovered from org/user…
 # # installation_id = 87654321 # …or set explicitly
 
+# MULTI-INSTALLATION routing — one agent key, several organizations.
+# Mutually exclusive with [mcp.github_app]. Each entry is one GitHub App
+# installation, keyed by its owner. tools/call frames route to the
+# installation matching the repository owner resolved from the CALL
+# ARGUMENTS — never from anything the agent chooses directly. At
+# `initialize`, ghpool eagerly mints one repo-scoped token and opens one
+# upstream MCP session per owner in the agent's repo allowlist (fail-closed:
+# any failure fails the whole initialize); the client sees a single session.
+# Requires [[mcp.agents]] with non-empty exact `repos` — every repo owner
+# must be covered by an entry here (validated at startup).
+# [[mcp.github_apps]]
+# app_id = "123456"            # the same App installed in both orgs, or…
+# private_key = "aws:secretsmanager:ghpool/app:private_key"
+# owner = "openabdev"          # routing key (unique across entries)
+# # installation_id = 87654321 # recommended: skip discovery
+#
+# [[mcp.github_apps]]
+# app_id = "654321"            # …a separate App per org
+# private_key = "aws:secretsmanager:ghpool/app-oablab:private_key"
+# owner = "oablab"
+# # installation_id = 12345678
+
 # Per-agent authentication + default-deny tool allowlists (Phase 2a).
 # When any [[mcp.agents]] entry exists, EVERY /mcp request must present a
 # valid X-Ghpool-Key header. tools/call for a tool not on the agent's

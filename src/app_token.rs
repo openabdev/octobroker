@@ -219,6 +219,52 @@ fn parse_rfc3339_unix(s: &str) -> Option<u64> {
     u64::try_from(parsed.unix_timestamp()).ok()
 }
 
+/// Multi-app mode: one `AppTokenProvider` per repository owner, enabling
+/// owner-based routing of tool calls to distinct GitHub App installations.
+///
+/// Critical correctness property: upstream MCP sessions are credential-pinned,
+/// so each owner's installation gets its own upstream session. The
+/// `MultiAppTokenProvider` never swaps tokens within a single upstream session.
+pub struct MultiAppTokenProvider {
+    /// owner (normalized lowercase) → provider
+    providers: HashMap<String, AppTokenProvider>,
+}
+
+impl MultiAppTokenProvider {
+    /// Construct from config entries. Returns Err on invalid PEM or missing
+    /// installation_id/owner.
+    pub fn new(
+        entries: &[crate::config::GithubAppsEntry],
+        api_base: String,
+    ) -> Result<Self, String> {
+        let mut providers = HashMap::new();
+        for entry in entries {
+            let owner = entry.owner.trim().to_lowercase();
+            let provider = AppTokenProvider::new(
+                entry.app_id.clone(),
+                &entry.private_key,
+                entry.installation_id,
+                Some(owner.clone()),
+                api_base.clone(),
+            )?;
+            providers.insert(owner, provider);
+        }
+        Ok(Self { providers })
+    }
+
+    /// Get the provider for a given owner (case-insensitive lookup).
+    /// Returns None when no App is configured for this owner.
+    pub fn get(&self, owner: &str) -> Option<&AppTokenProvider> {
+        self.providers.get(&owner.to_lowercase())
+    }
+
+    /// All configured owners (normalized lowercase).
+    #[cfg(test)]
+    pub fn owners(&self) -> impl Iterator<Item = &String> {
+        self.providers.keys()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -248,6 +294,21 @@ pub(crate) mod tests {
             .err()
             .unwrap();
         assert!(err.contains("invalid GitHub App private key"));
+    }
+
+    #[test]
+    fn test_multi_provider_owner_lookup_is_case_insensitive() {
+        let entries = vec![crate::config::GithubAppsEntry {
+            app_id: "1".into(),
+            private_key: TEST_RSA_PEM.into(),
+            installation_id: Some(1),
+            owner: "OpenABdev".into(),
+        }];
+        let m = MultiAppTokenProvider::new(&entries, "http://x".into()).unwrap();
+        assert!(m.get("openabdev").is_some());
+        assert!(m.get("OPENABDEV").is_some());
+        assert!(m.get("oablab").is_none());
+        assert_eq!(m.owners().count(), 1);
     }
 
     #[test]

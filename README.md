@@ -384,6 +384,68 @@ Required GitHub App permissions (grant only what your agents' tools need):
 
 The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/ghpool/issues/22)) — grant conservatively and expand as agents need more.
 
+#### Multi-installation routing (one key, many orgs)
+
+One agent, one `X-Ghpool-Key`, one MCP server entry — repositories in several
+organizations. Replace the singular `[mcp.github_app]` with one
+`[[mcp.github_apps]]` entry per installation (the same App installed in each
+org, or one App per org):
+
+```toml
+[[mcp.github_apps]]
+app_id = "123456"
+private_key = "aws:secretsmanager:ghpool/app:private_key"
+owner = "openabdev"            # routing key — unique per entry
+installation_id = 11111111     # recommended: skip discovery
+
+[[mcp.github_apps]]
+app_id = "123456"
+private_key = "aws:secretsmanager:ghpool/app:private_key"
+owner = "oablab"
+installation_id = 22222222
+
+[[mcp.agents]]
+id = "b0"
+key = "aws:secretsmanager:ghpool/mcp-keys:b0"
+tools = ["issue_read", "list_issues", "create_issue", "add_issue_comment"]
+repos = ["openabdev/openab", "oablab/chi"]   # owners select the installations
+```
+
+How it works:
+
+```
+b0 initialize (one downstream session)
+  ├─ upstream session A ← repo-scoped token, openabdev installation
+  └─ upstream session B ← repo-scoped token, oablab installation
+
+tools/call {owner: "openabdev", …} → session A (openabdev token)
+tools/call {owner: "oablab", …}    → session B (oablab token)
+```
+
+- **Routing is argument-derived** — the installation is selected by the
+  repository owner resolved from the call's `owner`/`repo` arguments, never
+  by anything the agent chooses directly. Owners outside the agent's `repos`
+  allowlist are denied before any credential is touched.
+- **Eager fan-out at `initialize`** — one repo-scoped token is minted and one
+  upstream session opened per owner in the agent's allowlist, fail-closed: if
+  any installation can't mint or initialize, the whole `initialize` fails.
+  Tokens are never mixed within one upstream session, preserving the pinning
+  invariant per installation.
+- **One downstream session** — the client sees a single session ID; ghpool
+  maps it to the per-installation upstream sessions. `DELETE` and
+  `notifications/*` fan out to every route. When a pinned token expires the
+  session gets 404 and the client re-initializes (fresh tokens all around).
+- **Startup validation** — duplicate owners, agents without `repos`, and repo
+  owners with no matching installation are all configuration errors.
+- **Audit attribution** — write records carry the exact installation:
+  `"cred": "github-app:openabdev"`.
+- Multi-installation mode requires `[[mcp.agents]]` — there is no
+  network-trust variant.
+
+Trade-off vs. one key per org: a leaked key reaches the allowlisted repos of
+**all** configured installations. Prefer separate agents/keys when you want
+per-org blast-radius isolation.
+
 Deployment notes:
 
 - Requires egress to `api.githubcopilot.com` (the only additional external dependency).

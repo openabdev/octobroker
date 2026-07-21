@@ -29,6 +29,9 @@ struct AppState {
     /// GitHub App installation token provider for the MCP path (2b).
     /// None = PAT pool backend.
     app_tokens: Option<app_token::AppTokenProvider>,
+    /// Multi-app mode: one provider per owner, for owner-based routing.
+    /// None = single-app or PAT-only mode.
+    multi_app_tokens: Option<app_token::MultiAppTokenProvider>,
     /// Durable audit sink for write-classified MCP calls (2b). None = audit
     /// not configured (writes cannot be enabled without it).
     audit: Option<audit::AuditSink>,
@@ -63,6 +66,21 @@ async fn main() {
         tracing::info!("MCP credential backend: GitHub App installation tokens");
     }
 
+    let multi_app_tokens = if !config.mcp.github_apps.is_empty() {
+        let provider = app_token::MultiAppTokenProvider::new(
+            &config.mcp.github_apps,
+            "https://api.github.com".to_string(),
+        )
+        .expect("invalid [[mcp.github_apps]] config");
+        tracing::info!(
+            "MCP credential backend: multi-app mode ({} owners)",
+            config.mcp.github_apps.len()
+        );
+        Some(provider)
+    } else {
+        None
+    };
+
     let audit = config.mcp.audit.as_ref().map(|a| {
         let sink = audit::AuditSink::open(&a.path).expect("invalid [mcp.audit] config");
         tracing::info!("MCP durable audit enabled → {}", a.path);
@@ -80,6 +98,7 @@ async fn main() {
             .time_to_idle(std::time::Duration::from_secs(config.mcp.session_ttl_secs))
             .build(),
         app_tokens,
+        multi_app_tokens,
         audit,
         write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
@@ -430,6 +449,7 @@ mod tests {
             http: reqwest::Client::new(),
             mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
             app_tokens: None,
+            multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
