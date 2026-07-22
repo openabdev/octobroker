@@ -336,7 +336,7 @@ pub async fn mcp_proxy(
     // checks above still apply; the upstream GitHub MCP server is not asked
     // to interpret a tool it does not expose.
     if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL) {
-        let local = handle_minimize_comment(&state, &cred, frame.as_ref().unwrap()).await;
+        let local = handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL).await;
         if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
             let call = crate::audit::CallInfo {
                 rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
@@ -656,8 +656,7 @@ fn custom_tool_definition() -> serde_json::Value {
                 "node_id": { "type": "string", "description": "Global GraphQL node ID of the comment." },
                 "classifier": {
                     "type": "string",
-                    "enum": MINIMIZE_CLASSIFIERS,
-                    "default": "OUTDATED"
+                    "enum": MINIMIZE_CLASSIFIERS
                 }
             },
             "required": ["owner", "repo", "node_id", "classifier"]
@@ -768,11 +767,12 @@ fn local_tool_error(
 async fn execute_graphql(
     state: &AppState,
     cred: &McpCredential,
+    graphql_url: &str,
     payload: &serde_json::Value,
 ) -> Result<(StatusCode, serde_json::Value), ()> {
     let response = state
         .http
-        .post(GITHUB_GRAPHQL_URL)
+        .post(graphql_url)
         .bearer_auth(cred.token())
         .header("user-agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
         .header("content-type", "application/json")
@@ -790,10 +790,19 @@ async fn execute_graphql(
     Ok((status, body))
 }
 
+/// GraphQL identity note: the viewer for an App installation token logs in
+/// as "<app-slug>[bot]", while Bot-authored comments carry the bare
+/// "<app-slug>" author login (empirically verified against api.github.com).
+/// Compare with the "[bot]" suffix normalized on both sides.
+fn normalize_actor(login: &str) -> &str {
+    login.strip_suffix("[bot]").unwrap_or(login)
+}
+
 async fn handle_minimize_comment(
     state: &AppState,
     cred: &McpCredential,
     frame: &Frame,
+    graphql_url: &str,
 ) -> LocalToolResponse {
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
         return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "arguments must be an object");
@@ -823,7 +832,7 @@ async fn handle_minimize_comment(
         "query": "query VerifyComment($id: ID!) { viewer { login } node(id: $id) { ... on IssueComment { author { login } issue { repository { nameWithOwner } } } ... on PullRequestReviewComment { author { login } pullRequest { repository { nameWithOwner } } } } }",
         "variables": { "id": node_id }
     });
-    let (verify_status, verify_body) = match execute_graphql(state, cred, &verify_payload).await {
+    let (verify_status, verify_body) = match execute_graphql(state, cred, graphql_url, &verify_payload).await {
         Ok(result) => result,
         Err(()) => {
             return local_tool_error(
@@ -844,7 +853,7 @@ async fn handle_minimize_comment(
         || verify_body.get("errors").is_some()
         || viewer.is_none()
         || author.is_none()
-        || viewer != author
+        || viewer.map(normalize_actor) != author.map(normalize_actor)
     {
         tracing::warn!("comment ownership check failed for {}/{}", owner, repo);
         return local_tool_error(
@@ -873,7 +882,7 @@ async fn handle_minimize_comment(
         "query": "mutation MinimizeComment($subjectId: ID!, $classifier: ReportedContentClassifiers!) { minimizeComment(input: { subjectId: $subjectId, classifier: $classifier }) { minimizedComment { isMinimized } } }",
         "variables": { "subjectId": node_id, "classifier": classifier }
     });
-    let (status, body) = match execute_graphql(state, cred, &payload).await {
+    let (status, body) = match execute_graphql(state, cred, graphql_url, &payload).await {
         Ok(result) => result,
         Err(()) => {
             tracing::error!("custom minimize_comment request failed for {}/{}", owner, repo);
@@ -2740,6 +2749,132 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    // ---- ghpool-owned tool: handler-level tests (mock GraphQL) ----
+
+    /// Mock api.github.com/graphql: VerifyComment queries answer with the
+    /// given author/repo (viewer is always the App bot identity, with the
+    /// "[bot]" suffix exactly as the live API returns it); MinimizeComment
+    /// mutations are recorded and succeed.
+    async fn spawn_mock_graphql(
+        author_login: &'static str,
+        node_repo: &'static str,
+        verify_errors: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use axum::{routing::post, Json, Router};
+        type Log = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+        let log: Log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let handler = move |Json(body): Json<serde_json::Value>| {
+            let log = log2.clone();
+            async move {
+                let query = body["query"].as_str().unwrap_or_default().to_string();
+                if query.contains("MinimizeComment") {
+                    log.lock().unwrap().push(body);
+                    return Json(serde_json::json!({
+                        "data": {"minimizeComment": {"minimizedComment": {"isMinimized": true}}}
+                    }));
+                }
+                if verify_errors {
+                    return Json(serde_json::json!({
+                        "data": null,
+                        "errors": [{"message": "Could not resolve node"}]
+                    }));
+                }
+                Json(serde_json::json!({
+                    "data": {
+                        "viewer": {"login": "oab-ghpool[bot]"},
+                        "node": {
+                            "author": {"login": author_login},
+                            "issue": {"repository": {"nameWithOwner": node_repo}}
+                        }
+                    }
+                }))
+            }
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}/", addr), log)
+    }
+
+    fn minimize_frame(owner: &str, repo: &str, classifier: &str) -> Frame {
+        Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(MINIMIZE_COMMENT_TOOL.to_string()),
+            arguments: Some(serde_json::json!({
+                "owner": owner,
+                "repo": repo,
+                "node_id": "IC_kwDOtest",
+                "classifier": classifier,
+            })),
+        }
+    }
+
+    fn app_cred() -> McpCredential {
+        McpCredential::App(crate::app_token::AppToken {
+            token: "ghs_test".to_string(),
+            expires_at: now() + 3600,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_minimize_accepts_app_bot_authored_comment() {
+        // The live API returns viewer "oab-ghpool[bot]" but Bot comment
+        // authors carry the bare "oab-ghpool" login — the ownership check
+        // must accept the App's own comments (empirically verified shape).
+        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/ghpool", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, 200);
+        assert_eq!(out.tool_error, Some(false));
+        let recorded = mutations.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one mutation");
+        assert_eq!(recorded[0]["variables"]["subjectId"], "IC_kwDOtest");
+        assert_eq!(recorded[0]["variables"]["classifier"], "OUTDATED");
+    }
+
+    #[tokio::test]
+    async fn test_minimize_rejects_human_authored_comment() {
+        let (gql, mutations) = spawn_mock_graphql("chaodu-agent", "openabdev/ghpool", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert!(mutations.lock().unwrap().is_empty(), "no mutation for foreign authors");
+    }
+
+    #[tokio::test]
+    async fn test_minimize_rejects_repo_mismatch() {
+        // node_id belongs to another repository than the policy-checked
+        // owner/repo arguments — must be refused before the mutation.
+        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/other-repo", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(out.tool_error, Some(true));
+        assert!(mutations.lock().unwrap().is_empty(), "no cross-repo mutation");
+    }
+
+    #[tokio::test]
+    async fn test_minimize_rejects_graphql_errors_and_bad_classifier() {
+        // GraphQL soft errors (HTTP 200 + errors[]) fail closed.
+        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/ghpool", true).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert!(mutations.lock().unwrap().is_empty());
+
+        // Unknown classifier is rejected before any network call.
+        let frame = minimize_frame("openabdev", "ghpool", "WRONG");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
+        assert_eq!(out.tool_error, Some(true));
     }
 
     #[tokio::test]
