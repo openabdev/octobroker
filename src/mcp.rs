@@ -56,10 +56,18 @@ const FWD_HEADERS: &[&str] = &[
 /// exposed by GitHub's hosted MCP server.
 const MINIMIZE_COMMENT_TOOL: &str = "octobroker_review_minimize_comment";
 const COMMIT_STATUS_TOOL: &str = "octobroker_commit_status_set";
+/// Formal PR review submission for the OpenAB council's enforce mode:
+/// APPROVE counts toward branch-protection required approvals, and
+/// REQUEST_CHANGES blocks merge until dismissed or superseded by the same
+/// bot's later APPROVE (a new review by the same user replaces its previous
+/// state). The event set is a closed server-side enum — COMMENT and
+/// PENDING are deliberately not expressible.
+const PR_REVIEW_TOOL: &str = "octobroker_pr_review_submit";
+const PR_REVIEW_EVENTS: &[&str] = &["APPROVE", "REQUEST_CHANGES"];
 /// Every octobroker-owned local tool. Any new entry must preserve the explicit
 /// per-agent allowlist, repository binding, write gate, and fail-closed audit
 /// requirements (see issue #44).
-const LOCAL_TOOLS: &[&str] = &[MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL];
+const LOCAL_TOOLS: &[&str] = &[MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL, PR_REVIEW_TOOL];
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const GITHUB_API_URL: &str = "https://api.github.com";
 const MINIMIZE_CLASSIFIERS: &[&str] = &[
@@ -360,6 +368,9 @@ pub async fn mcp_proxy(
         let local = match local_tool.as_str() {
             MINIMIZE_COMMENT_TOOL => {
                 handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL).await
+            }
+            PR_REVIEW_TOOL => {
+                handle_pr_review_submit(&state, &cred, frame.as_ref().unwrap(), GITHUB_API_URL).await
             }
             _ => {
                 handle_commit_status_set(&state, &cred, frame.as_ref().unwrap(), GITHUB_API_URL).await
@@ -709,6 +720,21 @@ fn local_tool_definition(name: &str) -> serde_json::Value {
                     "target_url": { "type": "string", "description": "http(s) URL with details, e.g. a review comment permalink." }
                 },
                 "required": ["owner", "repo", "sha", "state", "context"]
+            }
+        }),
+        PR_REVIEW_TOOL => serde_json::json!({
+            "name": PR_REVIEW_TOOL,
+            "description": "Submit a formal pull-request review: APPROVE (counts toward branch-protection required approvals) or REQUEST_CHANGES (blocks merge until dismissed or superseded by a later APPROVE from the same account). Comment-only reviews are not expressible.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner." },
+                    "repo": { "type": "string", "description": "Repository name." },
+                    "pull_number": { "type": "integer", "description": "Pull request number." },
+                    "event": { "type": "string", "enum": PR_REVIEW_EVENTS },
+                    "body": { "type": "string", "description": "Review body, e.g. the council verdict summary." }
+                },
+                "required": ["owner", "repo", "pull_number", "event", "body"]
             }
         }),
         other => unreachable!("unknown local tool: {}", other),
@@ -1125,6 +1151,127 @@ async fn handle_commit_status_set(
             false,
             StatusCode::OK,
             format!("Commit status '{}' set to {} on {}", context, status_state, sha),
+        ),
+        http_status: status.as_u16(),
+        tool_error: Some(false),
+    }
+}
+
+/// octobroker-owned tool: submit a formal pull-request review via GitHub's
+/// REST API (`POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews`). The
+/// event is validated against a closed server-side enum — APPROVE or
+/// REQUEST_CHANGES; comment-only and pending reviews are not expressible.
+/// The repository target is policy-checked upstream like every write and
+/// re-validated here as URL path segments. Success is exactly HTTP 200 with
+/// the state matching the requested event — anything else fails closed.
+async fn handle_pr_review_submit(
+    state: &AppState,
+    cred: &McpCredential,
+    frame: &Frame,
+    api_base: &str,
+) -> LocalToolResponse {
+    let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
+        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "arguments must be an object");
+    };
+    for key in ["owner", "repo", "event", "body"] {
+        if arguments.get(key).and_then(|value| value.as_str()).is_none() {
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::OK,
+                format!("missing or invalid argument: {}", key),
+            );
+        }
+    }
+    let owner = arguments["owner"].as_str().unwrap();
+    let repo = arguments["repo"].as_str().unwrap();
+    let event = arguments["event"].as_str().unwrap();
+    let body_text = arguments["body"].as_str().unwrap();
+    let Some(pull_number) = arguments.get("pull_number").and_then(|value| value.as_u64()) else {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "missing or invalid argument: pull_number",
+        );
+    };
+
+    if !valid_repo_segment(owner) || !valid_repo_segment(repo) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "owner or repo contains unsupported characters",
+        );
+    }
+    if pull_number == 0 {
+        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "pull_number must be positive");
+    }
+    if !PR_REVIEW_EVENTS.contains(&event) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "event must be one of: APPROVE, REQUEST_CHANGES",
+        );
+    }
+    if body_text.trim().is_empty() {
+        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "body must not be empty");
+    }
+
+    let payload = serde_json::json!({ "event": event, "body": body_text });
+    let url = format!(
+        "{}/repos/{}/{}/pulls/{}/reviews",
+        api_base.trim_end_matches('/'),
+        owner,
+        repo,
+        pull_number
+    );
+    let response = match state
+        .http
+        .post(&url)
+        .bearer_auth(cred.token())
+        .header("user-agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+        .header("accept", "application/vnd.github+json")
+        .header("x-github-api-version", "2022-11-28")
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("pr review approve request failed for {}/{}: {}", owner, repo, error);
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "GitHub review submission request failed",
+            );
+        }
+    };
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    let expected_state = if event == "APPROVE" { "APPROVED" } else { "CHANGES_REQUESTED" };
+    let submitted = status == StatusCode::OK
+        && body.get("state").and_then(|value| value.as_str()) == Some(expected_state);
+    if !submitted {
+        tracing::warn!(
+            "GitHub review submit ({}) failed for {}/{}#{} (HTTP {})",
+            event,
+            owner,
+            repo,
+            pull_number,
+            status
+        );
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            status,
+            "GitHub rejected the review submission",
+        );
+    }
+
+    LocalToolResponse {
+        response: tool_response(
+            frame.rpc_id.as_ref(),
+            false,
+            StatusCode::OK,
+            format!("{} review submitted on {}/{}#{}", event, owner, repo, pull_number),
         ),
         http_status: status.as_u16(),
         tool_error: Some(false),
@@ -2105,7 +2252,10 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert_eq!(names, vec![MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL]);
+        assert_eq!(
+            names,
+            vec![MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL, PR_REVIEW_TOOL]
+        );
     }
 
     #[test]
@@ -2118,6 +2268,7 @@ data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
         let text = String::from_utf8(injected).unwrap();
         assert!(text.contains(MINIMIZE_COMMENT_TOOL));
         assert!(text.contains(COMMIT_STATUS_TOOL));
+        assert!(text.contains(PR_REVIEW_TOOL));
     }
 
     #[test]
@@ -3286,6 +3437,146 @@ data: "id":1,"result":{"tools":[]}}
         let (api, _log) = spawn_mock_statuses(200, serde_json::json!({"state": "failure"})).await;
         let out = handle_commit_status_set(&state, &app_cred(), &frame, &api).await;
         assert_eq!(out.tool_error, Some(true));
+    }
+
+    // ---- octobroker-owned tool: PR review submit (mock REST) ----
+
+    fn pr_review_frame(arguments: serde_json::Value) -> Frame {
+        Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(PR_REVIEW_TOOL.to_string()),
+            arguments: Some(arguments),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pr_review_submit_approve_posts_to_reviews_endpoint() {
+        let (api, log) = spawn_mock_statuses(
+            200,
+            serde_json::json!({"id": 1, "state": "APPROVED"}),
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pr_review_frame(serde_json::json!({
+            "owner": "openabdev",
+            "repo": "openab",
+            "pull_number": 1418,
+            "event": "APPROVE",
+            "body": "Council verdict: LGTM ✅ — see the council comment above.",
+        }));
+        let out = handle_pr_review_submit(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.http_status, 200);
+        assert_eq!(out.tool_error, Some(false));
+        let recorded = log.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one review submission");
+        assert_eq!(recorded[0].0, "/repos/openabdev/openab/pulls/1418/reviews");
+        assert_eq!(recorded[0].1["event"], "APPROVE");
+        assert!(recorded[0].1["body"].as_str().unwrap().contains("LGTM"));
+    }
+
+    #[tokio::test]
+    async fn test_pr_review_submit_request_changes() {
+        let (api, log) = spawn_mock_statuses(
+            200,
+            serde_json::json!({"id": 2, "state": "CHANGES_REQUESTED"}),
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pr_review_frame(serde_json::json!({
+            "owner": "openabdev",
+            "repo": "openab",
+            "pull_number": 7,
+            "event": "REQUEST_CHANGES",
+            "body": "Council verdict: CHANGES REQUESTED — see the council comment above.",
+        }));
+        let out = handle_pr_review_submit(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.tool_error, Some(false));
+        let recorded = log.lock().unwrap();
+        assert_eq!(recorded[0].1["event"], "REQUEST_CHANGES");
+        // An APPROVED state answering a REQUEST_CHANGES event would fail closed
+        // (covered below); here the states match.
+    }
+
+    #[tokio::test]
+    async fn test_pr_review_submit_rejects_bad_arguments_before_network() {
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let base = serde_json::json!({
+            "owner": "openabdev",
+            "repo": "openab",
+            "pull_number": 1418,
+            "event": "APPROVE",
+            "body": "Council verdict: LGTM",
+        });
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("owner", serde_json::json!("open/abdev")),   // path escape
+            ("repo", serde_json::json!("openab?x=1")),    // query injection
+            ("pull_number", serde_json::json!("1418")),   // string, not integer
+            ("pull_number", serde_json::json!(0)),        // zero
+            ("pull_number", serde_json::json!(-3)),       // negative
+            ("event", serde_json::json!("COMMENT")),      // outside the closed enum
+            ("event", serde_json::json!("approve")),      // case-sensitive
+            ("body", serde_json::json!("   ")),           // blank body
+        ];
+        for (key, value) in cases {
+            let mut args = base.clone();
+            args[key] = value;
+            let frame = pr_review_frame(args);
+            let out = handle_pr_review_submit(&state, &app_cred(), &frame, "http://127.0.0.1:1").await;
+            assert_eq!(out.tool_error, Some(true), "case: {}", key);
+            assert_eq!(out.http_status, 200, "arg errors are tool errors, case: {}", key);
+        }
+        // Missing required arguments
+        let frame = pr_review_frame(serde_json::json!({"owner": "openabdev", "repo": "openab"}));
+        let out = handle_pr_review_submit(&state, &app_cred(), &frame, "http://127.0.0.1:1").await;
+        assert_eq!(out.tool_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_pr_review_submit_fails_closed_on_github_rejection() {
+        // 422 (e.g. reviewing your own PR, missing permission) → error.
+        let (api, _log) = spawn_mock_statuses(
+            422,
+            serde_json::json!({"message": "Unprocessable Entity"}),
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pr_review_frame(serde_json::json!({
+            "owner": "openabdev", "repo": "openab", "pull_number": 1418,
+            "event": "APPROVE", "body": "LGTM",
+        }));
+        let out = handle_pr_review_submit(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.http_status, 422);
+        assert_eq!(out.tool_error, Some(true));
+
+        // A 200 whose state does not match the requested event fails closed.
+        let (api, _log) =
+            spawn_mock_statuses(200, serde_json::json!({"state": "PENDING"})).await;
+        let out = handle_pr_review_submit(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.tool_error, Some(true));
+        let (api, _log) =
+            spawn_mock_statuses(200, serde_json::json!({"state": "CHANGES_REQUESTED"})).await;
+        let out = handle_pr_review_submit(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.tool_error, Some(true), "state must match the requested event");
+    }
+
+    #[tokio::test]
+    async fn test_phase1_mode_denies_local_pr_review_submit_tool() {
+        // No agents → local write tools must not bypass the write gate.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{{"owner":"openabdev","repo":"openab","pull_number":1,"event":"APPROVE","body":"LGTM"}}}}}}"#,
+                    PR_REVIEW_TOOL
+                ),
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
