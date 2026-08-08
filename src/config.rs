@@ -78,6 +78,14 @@ pub struct McpConfig {
     /// fail-closed audited). The App needs Contents: read/write for pushes.
     #[serde(default)]
     pub enable_git_credentials: bool,
+    /// Mint read-only (`contents: read`) git credentials instead of the
+    /// default `contents: write`. When true, the token issued by
+    /// /git-credential can `git clone`/fetch a private repo but CANNOT push —
+    /// letting a read-only agent be granted clone access without also granting
+    /// commit/push. With this set the App only needs Contents: read on the
+    /// target repositories. Default false (push-capable, unchanged behavior).
+    #[serde(default)]
+    pub git_credentials_read_only: bool,
     /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,
     /// or the full write-capable surface when enable_writes is set.
     #[serde(default)]
@@ -194,6 +202,7 @@ impl Default for McpConfig {
             enabled: false,
             enable_writes: false,
             enable_git_credentials: false,
+            git_credentials_read_only: false,
             upstream: None,
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),

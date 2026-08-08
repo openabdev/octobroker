@@ -59,6 +59,11 @@ enabled = false
 # before issuance. Client side: `obk git-credential` is a drop-in git
 # credential helper (see README for the fail-closed helper setup).
 # enable_git_credentials = false
+# Mint READ-ONLY git credentials (contents:read) instead of contents:write.
+# The issued token can `git clone`/fetch a private repo but CANNOT push —
+# for agents that need clone access without commit/push. With this set the
+# App only needs Contents: read. Default false (push-capable).
+# git_credentials_read_only = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4
 # Upstream MCP endpoint. Default: hosted read-only variant, or the full

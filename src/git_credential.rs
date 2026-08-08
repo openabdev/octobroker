@@ -167,9 +167,13 @@ pub async fn git_credential(
         return rpc_error(StatusCode::FORBIDDEN, "installation owner verification failed");
     }
 
-    // Git-specific token: exactly one repository + contents:write only,
-    // with a cache namespace separate from MCP tokens.
-    let token = match provider.token_git(name).await {
+    // Git-specific token: exactly one repository, with a cache namespace
+    // separate from MCP tokens. contents:write by default; contents:read
+    // (clone/fetch, no push) when git_credentials_read_only is set.
+    let token = match provider
+        .token_git(name, state.config.mcp.git_credentials_read_only)
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(
@@ -294,6 +298,7 @@ mod tests {
 
     async fn test_state(
         enabled: bool,
+        read_only: bool,
         sink: Option<crate::audit::AuditSink>,
     ) -> (Arc<AppState>, MintLog) {
         let (gh, mint_log) = spawn_mock_github().await;
@@ -334,6 +339,7 @@ mod tests {
                     enabled: true,
                     enable_writes: false,
                     enable_git_credentials: enabled,
+                    git_credentials_read_only: read_only,
                     upstream: None,
                     toolsets: vec![],
                     session_ttl_secs: 3600,
@@ -390,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_disabled_is_404() {
-        let (state, _) = test_state(false, None).await;
+        let (state, _) = test_state(false, false, None).await;
         let resp = app(state)
             .oneshot(req("openabdev/openab", Some("key-b0")))
             .await
@@ -402,7 +408,7 @@ mod tests {
     async fn test_missing_or_bad_key_is_401() {
         let path = audit_tmp("auth");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
-        let (state, mint_log) = test_state(true, Some(sink)).await;
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
         for key in [None, Some("wrong")] {
             let resp = app(state.clone())
                 .oneshot(req("openabdev/openab", key))
@@ -418,7 +424,7 @@ mod tests {
     async fn test_issues_single_repo_token_and_audits() {
         let path = audit_tmp("ok");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
-        let (state, mint_log) = test_state(true, Some(sink)).await;
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
         let resp = app(state)
             .oneshot(req("openabdev/openab", Some("key-b0")))
             .await
@@ -467,10 +473,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_only_mode_mints_contents_read() {
+        let path = audit_tmp("readonly");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        // git_credentials_read_only = true
+        let (state, mint_log) = test_state(true, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["username"], "x-access-token");
+        assert!(v["expires_at"].as_u64().unwrap() > 0);
+
+        // The mint envelope must request contents:READ — clone/fetch only,
+        // no push — never write when read-only is configured.
+        let minted = mint_log.lock().unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].1["repositories"], serde_json::json!(["openab"]));
+        assert_eq!(
+            minted[0].1["permissions"],
+            serde_json::json!({"contents": "read"})
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
     async fn test_routes_by_owner() {
         let path = audit_tmp("route");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
-        let (state, mint_log) = test_state(true, Some(sink)).await;
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
         let resp = app(state)
             .oneshot(req("oablab/chi", Some("key-b0")))
             .await
@@ -490,7 +524,7 @@ mod tests {
     async fn test_policy_denials() {
         let path = audit_tmp("deny");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
-        let (state, mint_log) = test_state(true, Some(sink)).await;
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
         // off-allowlist repo
         let resp = app(state.clone())
             .oneshot(req("openabdev/secret-repo", Some("key-b0")))
@@ -536,7 +570,7 @@ mod tests {
     async fn test_owner_mismatch_fails_closed() {
         let path = audit_tmp("mismatch");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
-        let (state, mint_log) = test_state(true, Some(sink)).await;
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
         // Config labels installation 43 as "mislabeled" but GitHub says the
         // installation account is "oablab" — the label must not be trusted.
         let resp = app(state)
@@ -563,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_fail_closed() {
         let sink = crate::audit::AuditSink::failing_for_tests();
-        let (state, mint_log) = test_state(true, Some(sink)).await;
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
         let resp = app(state)
             .oneshot(req("openabdev/openab", Some("key-b0")))
             .await
