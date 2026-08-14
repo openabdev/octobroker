@@ -122,7 +122,8 @@ enabled = false
 # Per-agent authentication + default-deny tool allowlists (Phase 2a).
 # When any [[mcp.agents]] entry exists, EVERY /mcp request must present a
 # valid X-Octobroker-Key header. tools/call for a tool not on the agent's
-# allowlist is rejected at the proxy (403); the allowlist is also injected
+# allowlist is rejected at the proxy with a tool error (isError: true, so
+# the calling model sees the denial); the allowlist is also injected
 # upstream as X-MCP-Tools. No entries = Phase 1 network-trust mode.
 #
 # Keys support the same secret references as identity tokens.

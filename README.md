@@ -324,7 +324,7 @@ key = "aws:secretsmanager:octobroker/mcp-keys:openab"   # env:/k8s: refs also wo
 tools = ["issue_read", "list_issues", "pull_request_read"]
 ```
 
-- With any agent configured, requests without a valid `X-Octobroker-Key` get `401`; a `tools/call` for a tool not on the agent's allowlist gets `403` at the proxy — it never reaches GitHub. The allowlist is also injected upstream as `X-MCP-Tools`, so `tools/list` natively shows the agent only its permitted tools.
+- With any agent configured, requests without a valid `X-Octobroker-Key` get `401`; a `tools/call` for a tool not on the agent's allowlist is rejected at the proxy with a model-visible tool error (`result.isError: true`, request id echoed) — it never reaches GitHub. The allowlist is also injected upstream as `X-MCP-Tools`, so `tools/list` natively shows the agent only its permitted tools.
 - New upstream tools are **denied by default** until added to an agent's `tools` list.
 - The key is a **octobroker credential, not a GitHub credential** — a leak is bounded by that agent's allowlist and revoked by editing octobroker config, without touching GitHub.
 - Audit lines include the agent: `MCP tools/call issue_read [agent=openab-bot via alice] [session=…]`.
