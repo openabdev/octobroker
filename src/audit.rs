@@ -119,11 +119,15 @@ impl AuditSink {
 
     /// Result record after owner verification + mint/cache lookup. A failure
     /// to persist a successful result rejects the credential response.
+    /// `mode` is the effective permission envelope ("read" or "write") —
+    /// recorded durably so the audit trail alone can answer whether an agent
+    /// held push capability at a point in time (mixed-mode fleets).
     pub fn record_git_credential_result(
         &self,
         agent: &str,
         credential: &str,
         repo: &str,
+        mode: &str,
         success: bool,
         expires_at: Option<u64>,
     ) -> Result<(), String> {
@@ -133,6 +137,7 @@ impl AuditSink {
             "agent": agent,
             "cred": credential,
             "repo": repo,
+            "mode": mode,
             "success": success,
             "expires_at": expires_at,
         }))

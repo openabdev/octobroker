@@ -194,6 +194,16 @@ pub struct McpAgentConfig {
     /// (deny-if-unresolvable). Empty = no repository restriction.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// Per-agent override of `[mcp] git_credentials_read_only`.
+    /// `true` = this agent's /git-credential tokens are minted `contents:
+    /// read` (clone/fetch, no push) regardless of the global default;
+    /// `false` = explicitly push-capable (`contents: write`), even when the
+    /// global default is read-only — the mixed-fleet case: a read-only fleet
+    /// default with one push-capable agent. Omitted (`None`) inherits the
+    /// global flag. Both values are operator-set config, never
+    /// agent-controlled.
+    #[serde(default)]
+    pub git_credentials_read_only: Option<bool>,
 }
 
 impl Default for McpConfig {
@@ -621,11 +631,42 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_git_credentials_read_only_toml_roundtrip() {
+        // Tri-state per-agent override: omitted → None (inherit global),
+        // explicit true/false → pinned. Guards the #[serde(default)] and
+        // the Option<bool> type against accidental refactors.
+        let m: McpConfig = toml::from_str(
+            r#"
+            enabled = true
+
+            [[agents]]
+            id = "inherits"
+            keys = ["k1"]
+
+            [[agents]]
+            id = "pinned-ro"
+            keys = ["k2"]
+            git_credentials_read_only = true
+
+            [[agents]]
+            id = "pinned-rw"
+            keys = ["k3"]
+            git_credentials_read_only = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(m.agents[0].git_credentials_read_only, None);
+        assert_eq!(m.agents[1].git_credentials_read_only, Some(true));
+        assert_eq!(m.agents[2].git_credentials_read_only, Some(false));
+    }
+
+    #[test]
     fn test_mcp_validate_write_gate() {
         let mut m = McpConfig { enabled: true, enable_writes: true, ..Default::default() };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
         m.agents.push(McpAgentConfig {
             id: "a".into(), key: None, keys: vec!["k".into()], tools: vec![], repos: vec![],
+            git_credentials_read_only: None,
         });
         assert!(m.validate().unwrap_err().contains("github_app"));
         m.github_app = Some(GithubAppConfig {
@@ -666,6 +707,7 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: repos.iter().map(|s| s.to_string()).collect(),
+                git_credentials_read_only: None,
             }
         }
 
@@ -783,6 +825,7 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: vec!["openabdev/openab".into()],
+                git_credentials_read_only: None,
             }
         }
         fn audit() -> Option<AuditConfig> {
