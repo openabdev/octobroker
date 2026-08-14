@@ -565,7 +565,7 @@ git push → obk git-credential (OCTOBROKER_KEY from env)
          → durable audit preflight (phase: git_credential_request)
          → installation owner verified against GitHub
          → Contents-only single-repo token (~1h, GitHub-enforced scope)
-         → audit result (phase: git_credential_result)
+         → audit result (phase: git_credential_result, mode: read|write)
          → push authenticated as <app>[bot]
 ```
 

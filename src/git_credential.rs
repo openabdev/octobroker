@@ -147,6 +147,15 @@ pub async fn git_credential(
         );
     }
 
+    // Effective credential mode, resolved from operator config only (never
+    // request input): the per-agent override wins over the global default in
+    // either direction; None inherits. Resolved before any result record so
+    // failure audits also carry the mode the agent was configured for.
+    let read_only = agent
+        .git_credentials_read_only
+        .unwrap_or(state.config.mcp.git_credentials_read_only);
+    let mode = if read_only { "read" } else { "write" };
+
     // Bind the configured route label / explicit installation ID to the
     // actual installation account returned by GitHub. Never trust config
     // labels alone: same-named repos can exist under another owner.
@@ -159,6 +168,7 @@ pub async fn git_credential(
             &agent.id,
             &cred_label,
             &repo_label,
+            mode,
             false,
             None,
         ) {
@@ -168,13 +178,8 @@ pub async fn git_credential(
     }
 
     // Git-specific token: exactly one repository, with a cache namespace
-    // separate from MCP tokens. contents:write by default; contents:read
-    // (clone/fetch, no push) when read-only is configured. The per-agent
-    // override wins over the global default in either direction; both are
-    // operator-set config, never agent-controlled.
-    let read_only = agent
-        .git_credentials_read_only
-        .unwrap_or(state.config.mcp.git_credentials_read_only);
+    // separate from MCP tokens (and read/write git tokens namespaced apart
+    // from each other).
     let token = match provider.token_git(name, read_only).await {
         Ok(t) => t,
         Err(e) => {
@@ -186,6 +191,7 @@ pub async fn git_credential(
                 &agent.id,
                 &cred_label,
                 &repo_label,
+                mode,
                 false,
                 None,
             ) {
@@ -200,6 +206,7 @@ pub async fn git_credential(
         &agent.id,
         &cred_label,
         &repo_label,
+        mode,
         true,
         Some(token.expires_at),
     ) {
@@ -219,7 +226,7 @@ pub async fn git_credential(
         name,
         agent.id,
         cred_label,
-        if read_only { "read" } else { "write" },
+        mode,
         token.expires_at
     );
     let body = serde_json::json!({
@@ -485,6 +492,7 @@ mod tests {
         assert_eq!(records[0]["phase"], "git_credential_request");
         assert_eq!(records[0]["decision"], "allow");
         assert_eq!(records[1]["phase"], "git_credential_result");
+        assert_eq!(records[1]["mode"], "write");
         assert_eq!(records[1]["success"], true);
         assert!(records[1]["expires_at"].as_u64().unwrap() > 0);
         for r in &records {
@@ -543,6 +551,15 @@ mod tests {
             minted[0].1["permissions"],
             serde_json::json!({"contents": "read"})
         );
+        // The durable audit result must record the effective mode.
+        let last: serde_json::Value = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .last()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .unwrap();
+        assert_eq!(last["phase"], "git_credential_result");
+        assert_eq!(last["mode"], "read");
         std::fs::remove_file(&path).ok();
     }
 
@@ -564,6 +581,15 @@ mod tests {
             minted[0].1["permissions"],
             serde_json::json!({"contents": "write"})
         );
+        // The durable audit result must record the effective mode.
+        let last: serde_json::Value = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .last()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .unwrap();
+        assert_eq!(last["phase"], "git_credential_result");
+        assert_eq!(last["mode"], "write");
         std::fs::remove_file(&path).ok();
     }
 
