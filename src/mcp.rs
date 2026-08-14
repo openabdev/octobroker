@@ -122,8 +122,8 @@ pub async fn mcp_proxy(
                         "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
                         tool_name, agent.id, session_suffix(session_id.as_deref())
                     );
-                    return rpc_error(
-                        StatusCode::FORBIDDEN,
+                    return tool_call_denied(
+                        frame.rpc_id.as_ref(),
                         "tool not permitted by agent policy",
                     );
                 }
@@ -139,8 +139,8 @@ pub async fn mcp_proxy(
                         "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
                         tool_name, agent.id, session_suffix(session_id.as_deref())
                     );
-                    return rpc_error(
-                        StatusCode::FORBIDDEN,
+                    return tool_call_denied(
+                        frame.rpc_id.as_ref(),
                         "write tools are not enabled",
                     );
                 }
@@ -156,8 +156,8 @@ pub async fn mcp_proxy(
                         "MCP tools/call {} DENIED (repo-less agent uses pooled PATs) [agent={}]{}",
                         tool_name, agent.id, session_suffix(session_id.as_deref())
                     );
-                    return rpc_error(
-                        StatusCode::FORBIDDEN,
+                    return tool_call_denied(
+                        frame.rpc_id.as_ref(),
                         "write tools require a repository-scoped agent",
                     );
                 }
@@ -169,8 +169,8 @@ pub async fn mcp_proxy(
                                 "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
                                 tool_name, agent.id, session_suffix(session_id.as_deref())
                             );
-                            return rpc_error(
-                                StatusCode::FORBIDDEN,
+                            return tool_call_denied(
+                                frame.rpc_id.as_ref(),
                                 "call has no resolvable repository target",
                             );
                         }
@@ -181,8 +181,8 @@ pub async fn mcp_proxy(
                                     tool_name, owner, repo_name, agent.id,
                                     session_suffix(session_id.as_deref())
                                 );
-                                return rpc_error(
-                                    StatusCode::FORBIDDEN,
+                                return tool_call_denied(
+                                    frame.rpc_id.as_ref(),
                                     "repository not permitted by agent policy",
                                 );
                             }
@@ -206,8 +206,8 @@ pub async fn mcp_proxy(
                 "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
                 local
             );
-            return rpc_error(
-                StatusCode::FORBIDDEN,
+            return tool_call_denied(
+                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
                 "local write tools require an authenticated write-enabled agent",
             );
         }
@@ -788,6 +788,23 @@ fn inject_custom_tools(
     } else {
         Some(encoded.into_bytes())
     }
+}
+
+/// Policy denial for a `tools/call`: returned as a *successful* JSON-RPC
+/// response carrying a tool-level error (`result.isError: true`) that echoes
+/// the request id. A protocol-level `rpc_error` (HTTP 403 with `id: null`)
+/// is un-correlatable by strict JSON-RPC clients and invisible to the model —
+/// observed in production leaving ACP agents (kiro-cli) hanging forever on
+/// the pending call. A tool error is fed back to the model so it can adapt
+/// (e.g. fall back to a public fetch). The fail-closed property is unchanged:
+/// denied calls still never mint or touch an upstream credential.
+fn tool_call_denied(rpc_id: Option<&serde_json::Value>, message: &str) -> Response {
+    tool_response(
+        rpc_id,
+        true,
+        StatusCode::OK,
+        format!("octobroker policy denied this call: {}", message),
+    )
 }
 
 fn tool_response(
@@ -2661,8 +2678,22 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(reqs[0].auth.as_deref(), Some("Bearer token-alice"));
     }
 
+    /// Assert the policy-denial shape: HTTP 200, correlated JSON-RPC id, and
+    /// a model-visible tool error (`result.isError: true`) whose text contains
+    /// `needle`. Regression guard for the id:null/403 hang (kiro-cli waited
+    /// forever on denied calls because the response was un-correlatable).
+    async fn assert_tool_denied(resp: Response, expected_id: i64, needle: &str) {
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], serde_json::json!(expected_id), "id must echo the request id");
+        assert_eq!(v["result"]["isError"], serde_json::json!(true));
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(needle), "expected {:?} in {:?}", needle, text);
+    }
+
     #[tokio::test]
-    async fn test_agent_denied_tool_is_403_and_never_reaches_upstream() {
+    async fn test_agent_denied_tool_is_tool_error_and_never_reaches_upstream() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
             &["alice"], &url, &[],
@@ -2675,11 +2706,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["error"]["message"].as_str().unwrap().contains("not permitted"));
+        assert_tool_denied(resp, 1, "not permitted").await;
 
         assert!(captured.lock().unwrap().is_empty());
     }
@@ -2695,7 +2722,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 1, "not permitted").await;
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -2757,7 +2784,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 2, "not permitted").await;
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
@@ -2858,7 +2885,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 2, "not permitted").await;
     }
 
     // ---- 2b-2: write classification + repo allowlists ----
@@ -2877,7 +2904,7 @@ data: "id":1,"result":{"tools":[]}}
     #[tokio::test]
     async fn test_write_tool_blocked_even_when_allowlisted() {
         // Operator mistake: create_issue on the allowlist while writes are
-        // not enabled → still 403, never reaches upstream.
+        // not enabled → still denied, never reaches upstream.
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
             &["alice"], &url, &[],
@@ -2890,10 +2917,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["error"]["message"].as_str().unwrap().contains("write tools"));
+        assert_tool_denied(resp, 1, "write tools").await;
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -2929,7 +2953,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 1, "repository not permitted").await;
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -2948,10 +2972,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["error"]["message"].as_str().unwrap().contains("no resolvable repository"));
+        assert_tool_denied(resp, 1, "no resolvable repository").await;
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -3148,7 +3169,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 1, "local write tools").await;
         assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
@@ -3304,7 +3325,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 1, "local write tools").await;
         assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
@@ -3745,7 +3766,7 @@ data: "id":1,"result":{"tools":[]}}
             vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
             4,
         );
-        // wrong repo → 403 even with writes enabled
+        // wrong repo → denied even with writes enabled
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"evil","repo":"other","title":"t"}}}"#,
@@ -3753,8 +3774,8 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        // tool off allowlist → 403
+        assert_tool_denied(resp, 1, "repository not permitted").await;
+        // tool off allowlist → denied
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_file","arguments":{"owner":"openabdev","repo":"octobroker"}}}"#,
@@ -3762,7 +3783,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 2, "not permitted").await;
         assert!(captured.lock().unwrap().is_empty());
         // denials never reach the durable audit (pre-flight is post-policy)
         let denied_path = audit_tmp("write-denied");
@@ -4125,7 +4146,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_tool_denied(resp, 1, "repository not permitted").await;
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -4410,10 +4431,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["error"]["message"].as_str().unwrap().contains("repository-scoped"));
+        assert_tool_denied(resp, 1, "repository-scoped").await;
         assert!(captured.lock().unwrap().is_empty());
         assert!(read_audit(&path).is_empty());
         std::fs::remove_file(&path).ok();

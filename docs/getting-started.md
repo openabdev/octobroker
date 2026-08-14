@@ -236,12 +236,18 @@ On ECS, run it as a Service Connect service and use
 
 ## Troubleshooting
 
+Policy denials of `tools/call` are returned as *tool errors* (HTTP 200, JSON-RPC
+result with `isError: true`, request id echoed) so the calling model sees the
+denial and can adapt. Protocol-level failures (auth, sessions) remain HTTP
+error codes.
+
 | Symptom | Meaning | Fix |
 |---------|---------|-----|
 | `401 X-Octobroker-Key header required` | Agents are configured; request has no/invalid key | Add the header to the client config; check the secret value |
-| `403 tool not permitted by agent policy` | Tool not on the agent's `tools` allowlist | Add it (deliberate: new tools are denied by default) |
-| `403 write tools are not enabled` | Write-classified tool without `enable_writes` | Complete Stage 4 |
-| `403 call has no resolvable repository target` | Agent has `repos` but the call's arguments name no repo (e.g. `search_code`) | Expected: repo-restricted agents can't use repo-less tools; remove `repos` or use repo-scoped tools |
+| Tool result `octobroker policy denied this call: tool not permitted by agent policy` | Tool not on the agent's `tools` allowlist | Add it (deliberate: new tools are denied by default) |
+| Tool result `… write tools are not enabled` | Write-classified tool without `enable_writes` | Complete Stage 4 |
+| Tool result `… call has no resolvable repository target` | Agent has `repos` but the call's arguments name no repo (e.g. `search_code`) | Expected: repo-restricted agents can't use repo-less tools; remove `repos` or use repo-scoped tools |
+| Tool result `… repository not permitted by agent policy` | Call targets a repo outside the agent's `repos` allowlist | Add the repo (or `owner/*`) to the agent's `repos`, or have the agent use a public fetch instead |
 | `403 session not owned by this agent` | Session ID reused by a different agent | Each agent keeps its own session; re-initialize |
 | `404 session not found or expired` | Pin evicted (TTL/restart) or credential expired | Normal: MCP clients re-initialize transparently |
 | `429 agent write concurrency limit reached` | In-flight cap hit | Raise `max_inflight_writes` or let calls drain |
