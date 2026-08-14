@@ -502,6 +502,20 @@ the singular `[mcp.github_app]` form, `owner` is **required** when git
 credentials are enabled — the explicit `installation_id` is verified against
 the installation's actual account before any token is issued.
 
+**Read-only (clone without push).** For an agent that should be able to
+`git clone`/fetch a private repo but never `git push`, set:
+
+```toml
+[mcp]
+enable_git_credentials = true
+git_credentials_read_only = true   # mint contents:read instead of write
+```
+
+The issued token then carries **`contents: read`** only — clone and fetch
+work, pushes are rejected by GitHub. In this mode the App only needs
+**Contents: read** on the target repositories. Default is `false`
+(push-capable, unchanged behavior).
+
 Agent side, `obk` doubles as a standard git credential helper. Register it
 as the **only** helper for `github.com` — `--replace-all` with an empty
 first entry clears any inherited helpers (osxkeychain, GCM, `gh auth
@@ -529,9 +543,11 @@ git push → obk git-credential (OCTOBROKER_KEY from env)
 Properties:
 
 - **Single-repo, Contents-only tokens** — each credential is minted with
-  exactly the repo being pushed and `contents: write` only, never the App's
-  full permission set; GitHub itself enforces both boundaries. Git tokens
-  are cached separately from MCP tokens.
+  exactly the repo being pushed and `contents: write` only (or `contents:
+  read` under `git_credentials_read_only`), never the App's full permission
+  set; GitHub itself enforces both boundaries. Git tokens are cached
+  separately from MCP tokens, and read-only tokens under their own namespace
+  distinct from write tokens.
 - **Owner binding** — the configured owner label is verified against the
   actual installation account (`GET /app/installations/{id}`) before
   issuance and re-verified hourly (accounts can rename); a mislabeled

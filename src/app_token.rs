@@ -131,12 +131,21 @@ impl AppTokenProvider {
     /// Git-over-HTTPS credential: a distinct cache namespace and a
     /// least-privilege permission envelope. `contents:write` is sufficient
     /// for fetch/push and prevents the returned token from bypassing MCP tool
-    /// policy for issues, PRs, Actions, administration, etc.
-    pub async fn token_git(&self, repository: &str) -> Result<AppToken, String> {
+    /// policy for issues, PRs, Actions, administration, etc. When `read_only`
+    /// is set the envelope is downscoped to `contents:read` — usable for
+    /// `git clone`/fetch but not push — and cached under a separate namespace
+    /// so a read-only credential can never be satisfied by a write token
+    /// (or vice versa).
+    pub async fn token_git(&self, repository: &str, read_only: bool) -> Result<AppToken, String> {
+        let (purpose, access) = if read_only {
+            ("git:contents=read", "read")
+        } else {
+            ("git:contents=write", "write")
+        };
         self.token_for(
-            "git:contents=write",
+            purpose,
             &[repository.to_string()],
-            Some(serde_json::json!({ "contents": "write" })),
+            Some(serde_json::json!({ "contents": access })),
         )
         .await
     }
@@ -595,19 +604,33 @@ pub(crate) mod tests {
         // MCP token first: same repo, default App permissions.
         let mcp = p.token_scoped(&["openab".into()]).await.unwrap();
         // Git token MUST mint separately despite identical repo envelope.
-        let git = p.token_git("openab").await.unwrap();
+        let git = p.token_git("openab", false).await.unwrap();
         assert_ne!(mcp.token, git.token);
         // Repeated git lookup hits its own cache.
-        assert_eq!(p.token_git("openab").await.unwrap().token, git.token);
+        assert_eq!(p.token_git("openab", false).await.unwrap().token, git.token);
+        // Read-only git token: a THIRD namespace — must mint separately and
+        // never be satisfied by (or satisfy) the write token above.
+        let git_ro = p.token_git("openab", true).await.unwrap();
+        assert_ne!(git.token, git_ro.token);
+        assert_eq!(p.token_git("openab", true).await.unwrap().token, git_ro.token);
 
         let seen = bodies.lock().unwrap();
-        assert_eq!(seen.len(), 2, "MCP and git cache namespaces must not overlap");
+        assert_eq!(
+            seen.len(),
+            3,
+            "MCP, write-git and read-git cache namespaces must not overlap"
+        );
         assert_eq!(seen[0]["repositories"], serde_json::json!(["openab"]));
         assert!(seen[0].get("permissions").is_none());
         assert_eq!(seen[1]["repositories"], serde_json::json!(["openab"]));
         assert_eq!(
             seen[1]["permissions"],
             serde_json::json!({"contents": "write"})
+        );
+        assert_eq!(seen[2]["repositories"], serde_json::json!(["openab"]));
+        assert_eq!(
+            seen[2]["permissions"],
+            serde_json::json!({"contents": "read"})
         );
     }
 
@@ -691,9 +714,9 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let (a, b, c) = tokio::join!(
-            p.token_git("openab"),
-            p.token_git("openab"),
-            p.token_git("openab"),
+            p.token_git("openab", false),
+            p.token_git("openab", false),
+            p.token_git("openab", false),
         );
         assert_eq!(a.unwrap().token, "ghs_single");
         assert_eq!(b.unwrap().token, "ghs_single");
@@ -745,11 +768,11 @@ pub(crate) mod tests {
         let start = Instant::now();
         let slow = {
             let p = p.clone();
-            tokio::spawn(async move { p.token_git("slowrepo").await })
+            tokio::spawn(async move { p.token_git("slowrepo", false).await })
         };
         // give the slow mint a head start so its lock is held
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let fast = p.token_git("fastrepo").await.unwrap();
+        let fast = p.token_git("fastrepo", false).await.unwrap();
         let fast_elapsed = start.elapsed();
         assert_eq!(fast.token, "ghs_fastrepo");
         assert!(
@@ -804,13 +827,13 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        p.token_git("goodrepo").await.unwrap();
+        p.token_git("goodrepo", false).await.unwrap();
         assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on success");
 
         // A wildcard-allowlisted agent can request arbitrary names; failed
         // mints must not leave lock entries behind (unbounded growth).
         for i in 0..5 {
-            p.token_git(&format!("badrepo{}", i)).await.unwrap_err();
+            p.token_git(&format!("badrepo{}", i), false).await.unwrap_err();
         }
         assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on failure");
     }
