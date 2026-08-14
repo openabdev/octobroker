@@ -194,6 +194,16 @@ pub struct McpAgentConfig {
     /// (deny-if-unresolvable). Empty = no repository restriction.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// Per-agent override of `[mcp] git_credentials_read_only`.
+    /// `true` = this agent's /git-credential tokens are minted `contents:
+    /// read` (clone/fetch, no push) regardless of the global default;
+    /// `false` = explicitly push-capable (`contents: write`), even when the
+    /// global default is read-only — the mixed-fleet case: a read-only fleet
+    /// default with one push-capable agent. Omitted (`None`) inherits the
+    /// global flag. Both values are operator-set config, never
+    /// agent-controlled.
+    #[serde(default)]
+    pub git_credentials_read_only: Option<bool>,
 }
 
 impl Default for McpConfig {
@@ -626,6 +636,7 @@ mod tests {
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
         m.agents.push(McpAgentConfig {
             id: "a".into(), key: None, keys: vec!["k".into()], tools: vec![], repos: vec![],
+            git_credentials_read_only: None,
         });
         assert!(m.validate().unwrap_err().contains("github_app"));
         m.github_app = Some(GithubAppConfig {
@@ -666,6 +677,7 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: repos.iter().map(|s| s.to_string()).collect(),
+                git_credentials_read_only: None,
             }
         }
 
@@ -783,6 +795,7 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: vec!["openabdev/openab".into()],
+                git_credentials_read_only: None,
             }
         }
         fn audit() -> Option<AuditConfig> {

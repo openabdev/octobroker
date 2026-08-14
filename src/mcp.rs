@@ -2011,6 +2011,7 @@ mod tests {
             keys: vec![key.to_string()],
             tools: tools.iter().map(|s| s.to_string()).collect(),
             repos: Vec::new(),
+            git_credentials_read_only: None,
         }
     }
 

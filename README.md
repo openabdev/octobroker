@@ -516,6 +516,35 @@ work, pushes are rejected by GitHub. In this mode the App only needs
 **Contents: read** on the target repositories. Default is `false`
 (push-capable, unchanged behavior).
 
+**Per-agent override.** Mixed fleets set the mode per agent instead: a
+`git_credentials_read_only` key on an `[[mcp.agents]]` entry wins over the
+global default, in either direction. The recommended posture for a fleet
+with one pusher is a read-only global default plus one explicit exception:
+
+```toml
+[mcp]
+enable_git_credentials = true
+git_credentials_read_only = true    # fleet default: clone-only
+
+[[mcp.agents]]
+id = "deployer"
+keys = ["aws:secretsmanager:octobroker/mcp-keys:deployer"]
+repos = ["openabdev/openab"]
+git_credentials_read_only = false   # the one push-capable agent
+
+[[mcp.agents]]
+id = "reviewer"
+keys = ["aws:secretsmanager:octobroker/mcp-keys:reviewer"]
+repos = ["openabdev/*"]
+# no override — inherits the read-only default
+```
+
+Omitting the per-agent key inherits the global flag. Both values are
+operator-set config — an agent can never choose its own mode. Read and write
+tokens are cached under separate namespaces, so agents with different modes
+never share credentials even for the same repository. Note the App itself
+must hold **Contents: Read & write** whenever any agent is push-capable.
+
 Agent side, `obk` doubles as a standard git credential helper. Register it
 as the **only** helper for `github.com` — `--replace-all` with an empty
 first entry clears any inherited helpers (osxkeychain, GCM, `gh auth

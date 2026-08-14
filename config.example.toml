@@ -62,7 +62,9 @@ enabled = false
 # Mint READ-ONLY git credentials (contents:read) instead of contents:write.
 # The issued token can `git clone`/fetch a private repo but CANNOT push —
 # for agents that need clone access without commit/push. With this set the
-# App only needs Contents: read. Default false (push-capable).
+# App only needs Contents: read. Default false (push-capable). Overridable
+# per agent: a `git_credentials_read_only` key on an [[mcp.agents]] entry
+# wins over this global default, in either direction (see below).
 # git_credentials_read_only = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4
@@ -140,6 +142,10 @@ enabled = false
 # # arguments; calls with no repo target (e.g. search_code, get_me) are
 # # DENIED. Empty/omitted = no repository restriction.
 # repos = ["openabdev/octobroker", "oablab/*"]
+# # Per-agent git credential mode: true = clone-only (contents:read),
+# # false = push-capable (contents:write). Overrides the global
+# # [mcp] git_credentials_read_only in either direction; omit to inherit.
+# # git_credentials_read_only = true
 #
 # [[mcp.agents]]
 # id = "ci-agent"
