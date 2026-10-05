@@ -1,0 +1,133 @@
+name: PR Discussion URL Check
+
+# Mirrors openabdev/openab's rule: every PR must link the Discord discussion it
+# came from. Without one the PR is labelled `closing-soon`, commented on, and
+# closed by close-stale-prs.yml after 24 hours.
+#
+# Differences from openab, because this repo has no GitHub App secret and no
+# team attached: it uses the built-in GITHUB_TOKEN, and it exempts maintainers
+# by their permission on this repo (write/maintain/admin) instead of membership
+# of openabdev/openab-maintainers, which GITHUB_TOKEN cannot read.
+#
+# pull_request_target runs the workflow from the base branch with a write token.
+# It is safe here because nothing from the PR is checked out or executed: the
+# script only reads the PR body and author from the event payload.
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: pr-discussion-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const body = pr.body || '';
+            const labels = pr.labels.map(l => l.name);
+            const marker = '<!-- openab-pr-discussion-check -->';
+            const label = 'closing-soon';
+            // Where community PRs are discussed. Set CHANNEL_URL to the channel's
+            // own link (https://discord.com/channels/<guild>/<channel>) to make the
+            // comment clickable and to require links into that channel only.
+            const CHANNEL_NAME = '#octobroker';
+            const CHANNEL_URL = '';
+
+            const discordLink = /https:\/\/(?:discord\.com|discordapp\.com)\/channels\/(\d+)\/(\d+)/g;
+            const links = [...body.matchAll(discordLink)];
+            let hasDiscordUrl = links.length > 0;
+            if (hasDiscordUrl && CHANNEL_URL) {
+              const [, guild, channel] = CHANNEL_URL.match(/channels\/(\d+)\/(\d+)/) || [];
+              hasDiscordUrl = links.some(m => m[1] === guild && m[2] === channel);
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: pr.number,
+              per_page: 100
+            });
+            const old = comments.find(c => c.body && c.body.includes(marker));
+
+            const clear = async () => {
+              if (old) {
+                await github.rest.issues.deleteComment({ ...context.repo, comment_id: old.id });
+              }
+              if (labels.includes(label)) {
+                try {
+                  await github.rest.issues.removeLabel({ ...context.repo, issue_number: pr.number, name: label });
+                } catch (e) { if (e.status !== 404) throw e; }
+              }
+            };
+
+            // Exempt bot-authored PRs (dependabot, release bots).
+            if (pr.user.type === 'Bot') {
+              console.log(`Skipping discussion check for bot PR by ${pr.user.login}`);
+              await clear();
+              return;
+            }
+
+            // Exempt maintainers: anyone with write access to this repository.
+            let permission = 'none';
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                ...context.repo,
+                username: pr.user.login
+              });
+              permission = data.permission;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+            if (['admin', 'maintain', 'write'].includes(permission)) {
+              console.log(`Skipping discussion check for maintainer ${pr.user.login} (${permission})`);
+              await clear();
+              return;
+            }
+
+            if (!hasDiscordUrl) {
+              if (!labels.includes(label)) {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  labels: [label]
+                });
+              }
+
+              const msg = [
+                marker,
+                '> [!CAUTION]',
+                `> This PR is missing a link to its discussion in the **${CHANNEL_NAME}** Discord channel.`,
+                '> This PR will be **automatically closed in 24 hours** if the link is not added.',
+                '',
+                `All community PRs must link the ${CHANNEL_NAME} Discord discussion where the change was agreed, so the direction is aligned before implementation.` +
+                  (CHANNEL_URL ? ` Start one here: ${CHANNEL_URL}` : ''),
+                '',
+                'Please edit the PR description to include a link like:',
+                '```',
+                'Discord Discussion URL: https://discord.com/channels/<server>/<octobroker channel>/<message>',
+                '```'
+              ].join('\n');
+
+              if (!old) {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  body: msg
+                });
+              }
+
+              core.setFailed(`PR body is missing a ${CHANNEL_NAME} Discord Discussion URL`);
+            } else {
+              await clear();
+            }
