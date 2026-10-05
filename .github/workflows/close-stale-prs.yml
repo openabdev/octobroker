@@ -1,0 +1,66 @@
+name: Close Stale closing-soon PRs
+
+# Companion to pr-discussion-check.yml (same rule as openabdev/openab): a PR that
+# has carried `closing-soon` for more than a day is closed with a comment.
+# pr-discussion-check removes the label as soon as a Discord link is added, so
+# only PRs that never got one are closed.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  close-stale:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const label = 'closing-soon';
+            const staleDays = 1;
+            const cutoff = new Date(Date.now() - staleDays * 24 * 60 * 60 * 1000);
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              ...context.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            for (const pr of prs) {
+              if (!pr.labels.some(l => l.name === label)) continue;
+
+              // When the label was (last) added.
+              const events = await github.paginate(github.rest.issues.listEvents, {
+                ...context.repo,
+                issue_number: pr.number,
+                per_page: 100
+              });
+              const labelEvent = events
+                .filter(e => e.event === 'labeled' && e.label?.name === label)
+                .pop();
+              if (!labelEvent) continue;
+
+              const labeledAt = new Date(labelEvent.created_at);
+              if (labeledAt > cutoff) continue;
+
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: pr.number,
+                body: `🔒 Auto-closing: this PR has had the \`${label}\` label for more than ${staleDays} day without a Discord Discussion URL.\n\nIf you'd like to continue working on this, please add the link and reopen, or submit a new PR and link to this one.`
+              });
+
+              await github.rest.pulls.update({
+                ...context.repo,
+                pull_number: pr.number,
+                state: 'closed'
+              });
+
+              console.log(`Closed PR #${pr.number} (labeled ${labeledAt.toISOString()})`);
+            }
