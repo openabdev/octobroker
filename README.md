@@ -374,7 +374,7 @@ How the write path is bounded:
 - **Scoped credentials**: when an agent's `repos` are all exact entries under one owner, its installation token is minted with the API's `repositories` parameter — **GitHub itself enforces the repo boundary**, independent of octobroker's argument parsing. Wildcard or mixed-owner allowlists fall back to an installation-wide token (proxy-side checks still apply).
 - **Audit**: two fsync'd JSONL records per write (pre-flight + result). The result captures the MCP tool outcome (`result.isError`) — HTTP 200 alone is not treated as success. If the pre-flight record cannot be persisted, the write is rejected (503) without reaching GitHub. Argument values are never recorded.
 - **No auto-retry**: octobroker never retries a forwarded call; an ambiguous write outcome (e.g. connection lost mid-response) is recorded as undeterminable and surfaced to the client — retry decisions belong to the caller.
-- **Revocation**: session pins live in process memory; key rotation uses dual `keys`, and any config change (agent disabled, policy tightened) takes effect by restart, which clears all sessions. Upstream session DELETE is a no-op at GitHub — octobroker's pin cache is the session authority.
+- **Revocation**: session pins live in process memory; key rotation uses dual `keys`, and any config change (agent disabled, policy tightened) takes effect by restart, which clears all sessions. Upstream session DELETE is a no-op at GitHub — octobroker's pin cache is the session authority. A restart cannot recall a token already handed to an agent (for example a `/git-credential` token), which stays valid at GitHub until it expires, so the worst-case revocation latency is the minted token's TTL (up to 1 hour, set by GitHub) plus the time to restart the broker ([#50](https://github.com/openabdev/octobroker/issues/50)).
 
 Required GitHub App permissions (grant only what your agents' tools need):
 
@@ -595,6 +595,25 @@ Properties:
   serve them. `gist.github.com` is not supported.
 - **Nothing to store** — `store`/`erase` are no-ops; tokens expire on their
   own. `cache-control: no-store` on the response.
+
+**Hardening: protect the default branch.** A `/git-credential` token is
+scoped to one repository, not to a branch. Inside that repository a
+push-capable token can push to any ref, including the default branch, and
+can force-push or delete branches. octobroker does not inspect refs, so the
+branch boundary has to come from GitHub. For every repository a
+push-capable agent can reach, add a
+[ruleset](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)
+or branch protection rule on the default branch that:
+
+- requires a pull request before merging, so agent changes land through review;
+- blocks force pushes, so history cannot be rewritten;
+- blocks deletion, so the branch cannot be removed.
+
+Do not add the App to the bypass list. Agents then push to their own
+branches and open PRs. Agents under `git_credentials_read_only` get
+`contents: read` tokens and cannot push, so this matters only for
+push-capable agents. See [#49](https://github.com/openabdev/octobroker/issues/49)
+for ref-level policy in the broker itself.
 
 Deployment notes:
 
