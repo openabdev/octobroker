@@ -252,10 +252,18 @@ pub async fn mcp_proxy(
             return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
         }
         Err(StatusCode::FORBIDDEN) => {
-            return rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent");
+            return rpc_error_with_id(
+                StatusCode::FORBIDDEN,
+                "session not owned by this agent",
+                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+            );
         }
         Err(StatusCode::BAD_GATEWAY) => {
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable");
+            return rpc_error_with_id(
+                StatusCode::BAD_GATEWAY,
+                "upstream credential unavailable",
+                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+            );
         }
         Err(code) => return rpc_error(code, "no upstream identity available"),
     };
@@ -316,9 +324,10 @@ pub async fn mcp_proxy(
                         "MCP write call rejected: agent {} at in-flight cap ({})",
                         aid, cap
                     );
-                    return rpc_error(
+                    return rpc_error_with_id(
                         StatusCode::TOO_MANY_REQUESTS,
                         "agent write concurrency limit reached",
+                        frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
                     );
                 }
             }
@@ -341,9 +350,10 @@ pub async fn mcp_proxy(
             // FAIL-CLOSED: a write whose audit record cannot be persisted
             // must not happen.
             tracing::error!("audit unavailable — rejecting write call (fail-closed): {}", e);
-            return rpc_error(
+            return rpc_error_with_id(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "audit backend unavailable — write rejected",
+                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
             );
         }
     }
@@ -413,7 +423,11 @@ pub async fn mcp_proxy(
             "credential '{}' is not a valid header value — check secret source",
             cred_label
         );
-        return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured");
+        return rpc_error_with_id(
+            StatusCode::BAD_GATEWAY,
+            "upstream credential misconfigured",
+            frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+        );
     };
     // Multi-installation routing: every installation has its own upstream
     // session. Secondary routes replace the downstream session ID with their
@@ -423,7 +437,11 @@ pub async fn mcp_proxy(
         match upstream_session {
             Some(us) if Some(us.as_str()) != session_id.as_deref() => {
                 let Ok(v) = us.parse() else {
-                    return rpc_error(StatusCode::BAD_GATEWAY, "invalid upstream session id");
+                    return rpc_error_with_id(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid upstream session id",
+                        frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                    );
                 };
                 upstream_headers.insert("mcp-session-id", v);
             }
@@ -438,7 +456,11 @@ pub async fn mcp_proxy(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("mcp upstream request failed: {}", e);
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed");
+            return rpc_error_with_id(
+                StatusCode::BAD_GATEWAY,
+                "upstream request failed",
+                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+            );
         }
     };
 
@@ -549,7 +571,11 @@ pub async fn mcp_proxy(
             }
             Err(e) => {
                 tracing::error!("tools/list response read failed: {}", e);
-                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+                return rpc_error_with_id(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream response failed",
+                    frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                );
             }
         }
     }
@@ -622,7 +648,11 @@ pub async fn mcp_proxy(
                 if let Err(e) = sink.record_result(&call, &outcome) {
                     tracing::error!("audit result record failed: {}", e);
                 }
-                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+                return rpc_error_with_id(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream response failed",
+                    frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                );
             }
         }
     }
@@ -1897,11 +1927,23 @@ fn audit_via(agent: Option<&crate::config::McpAgentConfig>, identity_id: &str) -
 }
 
 /// Minimal JSON-RPC error body for proxy-level failures, so MCP clients that
-/// only speak JSON-RPC degrade gracefully.
+/// only speak JSON-RPC degrade gracefully. Uses `id: null`: for failures
+/// before the request frame is parsed (or where no id applies).
 pub(crate) fn rpc_error(status: StatusCode, message: &str) -> Response {
+    rpc_error_with_id(status, message, None)
+}
+
+/// JSON-RPC error body that echoes the request id when one was parsed, so
+/// strict JSON-RPC clients can correlate the error with the pending call
+/// instead of hanging on it (#59). `None` yields `id: null`.
+pub(crate) fn rpc_error_with_id(
+    status: StatusCode,
+    message: &str,
+    rpc_id: Option<&serde_json::Value>,
+) -> Response {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": null,
+        "id": rpc_id.cloned().unwrap_or(serde_json::Value::Null),
         "error": { "code": -32000, "message": message }
     });
     Response::builder()
@@ -2558,6 +2600,8 @@ data: "id":1,"result":{"tools":[]}}
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
         assert!(v["error"]["message"].is_string());
+        // Expired session: the client must re-initialize, so id stays null
+        assert!(v["id"].is_null());
 
         // Upstream must never see a request for an unknown session
         assert!(captured.lock().unwrap().is_empty());
@@ -2836,6 +2880,34 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_session_not_owned_error_echoes_request_id() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![
+                agent("bot-a", "key-a", &["issue_read"]),
+                agent("bot-b", "key-b", &["issue_read"]),
+            ],
+        );
+        state.mcp_sessions.insert("sess-a".to_string(), pin("alice", Some("bot-a"))).await;
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-octobroker-key", "key-b"), ("mcp-session-id", "sess-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["error"]["message"], "session not owned by this agent");
+        assert!(captured.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3831,6 +3903,33 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_inflight_cap_error_echoes_request_id() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("cap-id");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url, sink,
+            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
+            1,
+        );
+        let _held = InFlightGuard::try_acquire(&state.write_inflight, "bot-w", 1).unwrap();
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":"req-42","method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"t"}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], "req-42");
+        assert_eq!(v["error"]["message"], "agent write concurrency limit reached");
         assert!(captured.lock().unwrap().is_empty());
         std::fs::remove_file(&path).ok();
     }
